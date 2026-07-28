@@ -199,9 +199,17 @@ def init_session():
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
-    # 初始化完成标志 —— 确保首轮不会吞输入
+    # 初始化完成标志
     if "initialized" not in st.session_state:
         st.session_state.initialized = True
+
+    # 场景摘要（剧本上传后填充）
+    if "scenario_summary" not in st.session_state:
+        st.session_state.scenario_summary = {}
+
+    # 当前场景位置（随着游戏推进更新）
+    if "current_scene" not in st.session_state:
+        st.session_state.current_scene = ""
 
 
 # ===================== 侧边栏 =====================
@@ -329,6 +337,44 @@ def render_sidebar():
         if rule_count == 0 and scenario_count == 0:
             st.caption("未加载知识库（可选）")
 
+        # ---- 场景摘要（上传剧本后显示） ----
+        summary = st.session_state.get("scenario_summary", {})
+        if summary and summary.get("title"):
+            with st.expander("📋 剧本摘要", expanded=False):
+                if summary.get("title"):
+                    st.markdown(f"**{summary['title']}**")
+                if summary.get("era"):
+                    st.caption(f"🕰 {summary['era']}")
+                if summary.get("location"):
+                    st.caption(f"📍 {summary['location']}")
+                if summary.get("difficulty"):
+                    st.caption(f"🎯 难度：{summary['difficulty']}")
+                if summary.get("theme"):
+                    st.caption(f"📝 主题：{summary['theme']}")
+                if summary.get("npcs"):
+                    st.markdown("**👥 关键人物**")
+                    for npc in summary["npcs"][:6]:
+                        st.caption(f"· {npc}")
+                if summary.get("chapters"):
+                    st.markdown("**📑 章节**")
+                    for ch in summary["chapters"][:8]:
+                        st.caption(f"· {ch}")
+
+        # ---- 当前场景位置 ----
+        current_scene = st.session_state.get("current_scene", "")
+        turn_count = len([m for m in st.session_state.get("messages", []) if m.get("role") == "user"])
+        if turn_count > 0:
+            st.divider()
+            st.markdown("📍 **当前进度**")
+            st.caption(f"回合数：{turn_count}")
+            if current_scene:
+                st.caption(f"位置：{current_scene}")
+            # 根据回合数显示进度条
+            chapters = summary.get("chapters", [])
+            if chapters:
+                progress = min(turn_count / max(len(chapters) * 3, 1), 1.0)
+                st.progress(progress, text=f"剧本进度 {int(progress * 100)}%")
+
         st.divider()
 
         # ---- 重置按钮 ----
@@ -410,12 +456,78 @@ def _handle_rule_uploads(uploaded_files: list):
     _index_files(uploaded_files, "rule")
 
 
+def _extract_scenario_summary(text: str, filename: str) -> dict:
+    """
+    从上传的剧本/规则书文本中提取结构化摘要。
+    支持常见 COC 剧本格式：标题、时代背景、NPC、章节等。
+    """
+    lines = text.split("\n")
+    summary = {
+        "title": filename.replace(".txt", "").replace(".pdf", ""),
+        "era": "",
+        "location": "",
+        "npcs": [],
+        "chapters": [],
+        "difficulty": "",
+        "theme": "",
+    }
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # 匹配标题
+        if stripped.startswith("COC") or "剧本" in stripped and "：" in stripped:
+            if summary["title"] == filename.replace(".txt", "").replace(".pdf", ""):
+                summary["title"] = stripped.lstrip("= ").rstrip(" =")
+
+        # 时代背景
+        if "时代背景" in stripped or "年代" in stripped:
+            summary["era"] = stripped.split("：")[-1].split(":")[-1].strip()[:50]
+
+        # 地点
+        if "地点" in stripped or "舞台" in stripped or "镇" in stripped and "背景" not in stripped:
+            val = stripped.split("：")[-1].split(":")[-1].strip()[:40]
+            if val and len(val) > 1:
+                summary["location"] = val
+
+        # NPC 名称（中文名+括号格式）
+        if "（" in stripped and "）" in stripped and len(stripped) < 60:
+            import re
+            name_match = re.match(r'^[一-鿿]{2,4}[（(].+[）)]', stripped)
+            if name_match and len(summary["npcs"]) < 8:
+                summary["npcs"].append(stripped[:40])
+
+        # 章节/部分
+        if (stripped.startswith("第") and ("部分" in stripped or "章" in stripped)) or \
+           stripped.startswith("Part") or \
+           (stripped.startswith("##") and len(stripped) < 30):
+            chapter = stripped.lstrip("# ").rstrip(" -")
+            if chapter and len(summary["chapters"]) < 10:
+                summary["chapters"].append(chapter[:50])
+
+        # 难度
+        if "难度" in stripped and "：" in stripped:
+            summary["difficulty"] = stripped.split("：")[-1].split(":")[-1].strip()[:20]
+
+        # 主题
+        if "主题" in stripped and "：" in stripped:
+            summary["theme"] = stripped.split("：")[-1].split(":")[-1].strip()[:60]
+
+    return summary
+
+
 def _handle_scenario_uploads(uploaded_files: list):
-    """处理剧本上传：入库 + 触发开场白重新生成。"""
+    """处理剧本上传：入库 + 提取摘要 + 触发开场白重新生成。"""
     new_contents = _index_files(uploaded_files, "scenario")
 
     if new_contents:
         combined = "\n\n---\n\n".join(c[:1500] for c in new_contents[:3])
+        # 提取场景摘要
+        summary = _extract_scenario_summary(new_contents[0],
+                                             uploaded_files[0].name if uploaded_files else "")
+        st.session_state.scenario_summary = summary
         st.session_state.pending_opening_content = combined[:3000]
 
 
@@ -446,6 +558,8 @@ def _reset_game():
     st.session_state.opening_narrative = scene
     st.session_state.story_goal = goal
     st.session_state.current_suggestions = []
+    st.session_state.scenario_summary = {}
+    st.session_state.current_scene = ""
 
     st.session_state.langgraph_state = create_initial_state(
         character=new_character,
@@ -627,7 +741,7 @@ def _render_input_area():
             st.warning("📖 **故事落幕。** 点击侧边栏「🔄 重置游戏」开启一段新的故事。")
         return
 
-    # 处理中状态：显示进度指示，禁用输入
+    # 处理中状态：显示进度指示 + 强制跳过按钮
     if st.session_state.processing:
         elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
         st.markdown(
@@ -637,7 +751,32 @@ def _render_input_area():
             f'</div>',
             unsafe_allow_html=True,
         )
-        # 渲染当前场景的建议，但不允许交互
+        # 超过 15 秒后显示跳过按钮
+        if elapsed >= 15:
+            col_a, col_b = st.columns([1, 3])
+            with col_a:
+                if st.button("⏭ 跳过等待", key=f"skip_{elapsed}", use_container_width=True,
+                             help="中断当前请求，KP 会使用降级回复"):
+                    st.session_state.processing = False
+                    st.session_state.pop("_processing_start", None)
+                    # 注入降级回复
+                    msgs = list(st.session_state.messages)
+                    msgs.append({
+                        "role": "system",
+                        "content": "⏭ KP 响应超时，已被跳过。",
+                    })
+                    msgs.append({
+                        "role": "assistant",
+                        "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待——它不急。你决定继续前行。",
+                    })
+                    st.session_state.messages = msgs
+                    st.session_state.current_suggestions = [
+                        "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
+                    ]
+                    st.rerun()
+            with col_b:
+                st.caption("KP 正在生成回复，请耐心等待……若超过 30 秒建议跳过")
+        # 渲染建议
         suggestions = st.session_state.get("current_suggestions", [])
         if suggestions:
             st.caption("💡 **你可以这样做：**")
@@ -723,6 +862,9 @@ def _process_player_input(player_input: str):
         # ---- 更新当前场景的建议（确保跟随最新场景） ----
         st.session_state.current_suggestions = new_state.get("suggestions", [])
 
+        # ---- 自动推断当前场景位置 ----
+        _update_current_scene(new_state, player_input)
+
         # ---- 流式渲染最新输出 ----
         _stream_render(new_state)
 
@@ -757,6 +899,56 @@ def _process_player_input(player_input: str):
         st.session_state.processing = False
         st.session_state.pop("_processing_start", None)
         st.rerun()
+
+
+def _update_current_scene(state: dict, player_input: str):
+    """
+    从 KP 的回复中自动推断当前场景位置。
+    通过检测常见的场景关键词来追踪玩家进度。
+    """
+    # 场景关键词映射
+    SCENE_KEYWORDS = [
+        ("码头", "🚢 乌蘅镇码头"),
+        ("茶馆", "🍵 镇上茶馆"),
+        ("沈宅", "🏚 沈家祖宅"),
+        ("沈家", "🏚 沈家祖宅"),
+        ("大门", "🏚 沈家祖宅大门"),
+        ("前院", "🏚 沈家祖宅前院"),
+        ("枯井", "🏚 沈家祖宅前院·枯井"),
+        ("祠堂", "🏛 沈家祠堂"),
+        ("后院", "🏚 沈家祖宅后院"),
+        ("木棺", "⚰ 后院·黑色木棺"),
+        ("黑棺", "⚰ 后院·黑色木棺"),
+        ("密室", "🔮 地下密室"),
+        ("地下", "🔮 地下密室"),
+        ("城隍", "🏚 废弃城隍庙"),
+        ("陈老道", "🏚 废弃城隍庙"),
+        ("石碑", "🗿 禁地石碑"),
+        ("禁地", "🗿 禁地石碑"),
+        ("河眼", "🌊 河眼洞穴"),
+        ("深潭", "🌊 河眼洞穴"),
+        ("洞穴", "🌊 河眼洞穴"),
+        ("镇河录", "📖 获知真相"),
+        ("封印", "✨ 进行封印仪式"),
+        ("契约", "📖 获知真相"),
+    ]
+
+    messages = state.get("messages", [])
+    # 从最近的 assistant 消息中搜索场景关键词
+    recent_text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant" and "[KP梗概]" not in msg.get("content", ""):
+            recent_text = msg.get("content", "")
+            if len(recent_text) > 20:
+                break
+
+    # 也从玩家输入中检测
+    search_text = player_input + " " + recent_text
+
+    for keyword, scene_name in SCENE_KEYWORDS:
+        if keyword in search_text:
+            st.session_state.current_scene = scene_name
+            break
 
 
 def _stream_render(state: dict):
