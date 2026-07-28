@@ -13,8 +13,8 @@ chroma_db/
 data/memory/*
 !data/memory/.gitkeep
 
-# 模型文件
-models/
+# 模型文件（已上传，勿再忽略）
+# models/
 
 # IDE
 .vscode/
