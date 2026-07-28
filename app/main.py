@@ -203,10 +203,6 @@ def init_session():
     if "initialized" not in st.session_state:
         st.session_state.initialized = True
 
-    # 场景摘要（剧本上传后填充）
-    if "scenario_summary" not in st.session_state:
-        st.session_state.scenario_summary = {}
-
     # 当前场景位置（随着游戏推进更新）
     if "current_scene" not in st.session_state:
         st.session_state.current_scene = ""
@@ -337,29 +333,6 @@ def render_sidebar():
         if rule_count == 0 and scenario_count == 0:
             st.caption("未加载知识库（可选）")
 
-        # ---- 场景摘要（上传剧本后显示） ----
-        summary = st.session_state.get("scenario_summary", {})
-        if summary and summary.get("title"):
-            with st.expander("📋 剧本摘要", expanded=False):
-                if summary.get("title"):
-                    st.markdown(f"**{summary['title']}**")
-                if summary.get("era"):
-                    st.caption(f"🕰 {summary['era']}")
-                if summary.get("location"):
-                    st.caption(f"📍 {summary['location']}")
-                if summary.get("difficulty"):
-                    st.caption(f"🎯 难度：{summary['difficulty']}")
-                if summary.get("theme"):
-                    st.caption(f"📝 主题：{summary['theme']}")
-                if summary.get("npcs"):
-                    st.markdown("**👥 关键人物**")
-                    for npc in summary["npcs"][:6]:
-                        st.caption(f"· {npc}")
-                if summary.get("chapters"):
-                    st.markdown("**📑 章节**")
-                    for ch in summary["chapters"][:8]:
-                        st.caption(f"· {ch}")
-
         # ---- 当前场景位置 ----
         current_scene = st.session_state.get("current_scene", "")
         turn_count = len([m for m in st.session_state.get("messages", []) if m.get("role") == "user"])
@@ -369,11 +342,6 @@ def render_sidebar():
             st.caption(f"回合数：{turn_count}")
             if current_scene:
                 st.caption(f"位置：{current_scene}")
-            # 根据回合数显示进度条
-            chapters = summary.get("chapters", [])
-            if chapters:
-                progress = min(turn_count / max(len(chapters) * 3, 1), 1.0)
-                st.progress(progress, text=f"剧本进度 {int(progress * 100)}%")
 
         st.divider()
 
@@ -456,78 +424,12 @@ def _handle_rule_uploads(uploaded_files: list):
     _index_files(uploaded_files, "rule")
 
 
-def _extract_scenario_summary(text: str, filename: str) -> dict:
-    """
-    从上传的剧本/规则书文本中提取结构化摘要。
-    支持常见 COC 剧本格式：标题、时代背景、NPC、章节等。
-    """
-    lines = text.split("\n")
-    summary = {
-        "title": filename.replace(".txt", "").replace(".pdf", ""),
-        "era": "",
-        "location": "",
-        "npcs": [],
-        "chapters": [],
-        "difficulty": "",
-        "theme": "",
-    }
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        # 匹配标题
-        if stripped.startswith("COC") or "剧本" in stripped and "：" in stripped:
-            if summary["title"] == filename.replace(".txt", "").replace(".pdf", ""):
-                summary["title"] = stripped.lstrip("= ").rstrip(" =")
-
-        # 时代背景
-        if "时代背景" in stripped or "年代" in stripped:
-            summary["era"] = stripped.split("：")[-1].split(":")[-1].strip()[:50]
-
-        # 地点
-        if "地点" in stripped or "舞台" in stripped or "镇" in stripped and "背景" not in stripped:
-            val = stripped.split("：")[-1].split(":")[-1].strip()[:40]
-            if val and len(val) > 1:
-                summary["location"] = val
-
-        # NPC 名称（中文名+括号格式）
-        if "（" in stripped and "）" in stripped and len(stripped) < 60:
-            import re
-            name_match = re.match(r'^[一-鿿]{2,4}[（(].+[）)]', stripped)
-            if name_match and len(summary["npcs"]) < 8:
-                summary["npcs"].append(stripped[:40])
-
-        # 章节/部分
-        if (stripped.startswith("第") and ("部分" in stripped or "章" in stripped)) or \
-           stripped.startswith("Part") or \
-           (stripped.startswith("##") and len(stripped) < 30):
-            chapter = stripped.lstrip("# ").rstrip(" -")
-            if chapter and len(summary["chapters"]) < 10:
-                summary["chapters"].append(chapter[:50])
-
-        # 难度
-        if "难度" in stripped and "：" in stripped:
-            summary["difficulty"] = stripped.split("：")[-1].split(":")[-1].strip()[:20]
-
-        # 主题
-        if "主题" in stripped and "：" in stripped:
-            summary["theme"] = stripped.split("：")[-1].split(":")[-1].strip()[:60]
-
-    return summary
-
-
 def _handle_scenario_uploads(uploaded_files: list):
-    """处理剧本上传：入库 + 提取摘要 + 触发开场白重新生成。"""
+    """处理剧本上传：入库 + 触发开场白重新生成。"""
     new_contents = _index_files(uploaded_files, "scenario")
 
     if new_contents:
         combined = "\n\n---\n\n".join(c[:1500] for c in new_contents[:3])
-        # 提取场景摘要
-        summary = _extract_scenario_summary(new_contents[0],
-                                             uploaded_files[0].name if uploaded_files else "")
-        st.session_state.scenario_summary = summary
         st.session_state.pending_opening_content = combined[:3000]
 
 
@@ -558,7 +460,6 @@ def _reset_game():
     st.session_state.opening_narrative = scene
     st.session_state.story_goal = goal
     st.session_state.current_suggestions = []
-    st.session_state.scenario_summary = {}
     st.session_state.current_scene = ""
 
     st.session_state.langgraph_state = create_initial_state(
