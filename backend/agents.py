@@ -219,39 +219,37 @@ def call_kp(
     messages.append({"role": "user", "content": player_input})
 
     # ---------- 调用 LLM，含 JSON 解析重试 ----------
-    max_json_retries = 2
+    # 简化策略：最多 2 次尝试（1次正常 + 1次格式纠正），不再嵌套 API 重试
     raw_output = None
 
-    for attempt in range(max_json_retries + 1):
+    for attempt in range(2):  # 最多 2 次
         try:
             raw_output = _call_with_retry(
                 messages=messages,
                 model=KP_MODEL,
                 temperature=0.8,
                 max_tokens=1024,
-                description="KP",
+                description=f"KP(attempt {attempt + 1})",
             )
 
             logger.info(f"KP 原始输出 (attempt {attempt + 1}): {raw_output[:200]}...")
 
-            # 尝试解析 JSON
             result = _parse_kp_json(raw_output)
             if result:
                 return result
 
-            # 重试时在末尾追加格式纠正提示
-            if attempt < max_json_retries:
+            # JSON 解析失败，追加格式纠正提示再试一次
+            if attempt == 0:
+                logger.warning("KP JSON 解析失败，追加格式提示后重试...")
                 messages.append({
                     "role": "user",
                     "content": "请严格以 JSON 格式回复，确保可以被 json.loads() 解析。"
                 })
 
         except RuntimeError as e:
-            logger.error(f"KP 调用异常 (attempt {attempt + 1}): {e}")
-            if attempt >= max_json_retries:
-                break
-            wait = 2.0 * (attempt + 1)
-            time.sleep(wait)
+            logger.error(f"KP API 调用失败 (attempt {attempt + 1}): {e}")
+            # API 调用失败直接退出，不重试（_call_with_retry 已经处理了重试）
+            break
 
     # 兜底返回
     logger.error(f"KP 调用最终失败，使用兜底回复。原始输出: {str(raw_output)[:200]}")
