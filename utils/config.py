@@ -20,6 +20,16 @@ MAX_CONTEXT_ROUNDS = 5          # 保留最近 N 轮对话
 RAG_TOP_K = 3                   # RAG 检索 Top K 段落
 RAG_SIMILARITY_THRESHOLD = 0.15  # RAG 相似度阈值（all-MiniLM-L6-v2 对中文的余弦相似度偏低，调低阈值）
 
+# ---------- API 超时配置 ----------
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "45"))   # API 单次调用超时
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "1"))            # 失败后重试次数
+
+# ---------- 模型配置 ----------
+# KP 主力模型（叙事 + 检定判断，需要强创造力）—— 默认 Flash 以加快响应
+KP_MODEL = os.getenv("KP_MODEL", "deepseek-v4-flash")
+# Render 模型（环境润色，较简单任务）—— 始终用 Flash
+RENDER_MODEL = os.getenv("RENDER_MODEL", "deepseek-v4-flash")
+
 # ---------- 记忆概括配置 ----------
 MEMORY_SUMMARIZE_INTERVAL = 6        # 每 N 轮对话触发一次概括
 MEMORY_DIR = "./data/memory"         # 记忆文件存储根目录
@@ -51,6 +61,20 @@ def get_config() -> dict:
 def get_openai_client() -> OpenAI:
     """
     返回 OpenAI 兼容的 Client 实例，用于调用 DeepSeek API。
+    设置超时防止请求无限挂起。
     """
+    import httpx
+
     cfg = get_config()
-    return OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
+    timeout = httpx.Timeout(
+        connect=10.0,          # 连接超时
+        read=API_TIMEOUT_SECONDS,   # 读取超时
+        write=10.0,            # 写入超时
+        pool=5.0,              # 连接池超时
+    )
+    return OpenAI(
+        api_key=cfg["api_key"],
+        base_url=cfg["base_url"],
+        timeout=timeout,
+        max_retries=0,  # 我们自己处理重试
+    )

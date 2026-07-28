@@ -13,6 +13,7 @@ import os
 import uuid
 import time
 import json
+import threading
 
 # 确保项目根目录在 Python 路径中
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,6 +121,23 @@ st.markdown("""
         background: rgba(192, 132, 252, 0.12);
         border-color: rgba(192, 132, 252, 0.5);
     }
+    /* ========== 处理中状态 ========== */
+    .processing-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.6rem 1rem;
+        background: rgba(192, 132, 252, 0.1);
+        border: 1px solid rgba(192, 132, 252, 0.3);
+        border-radius: 8px;
+        font-size: 0.9rem;
+        color: #c084fc;
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -129,6 +147,7 @@ st.markdown("""
 def init_session():
     """
     初始化 Streamlit session state。
+    仅在首次加载时执行，不会重复初始化已有会话。
     """
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
@@ -156,9 +175,11 @@ def init_session():
         st.session_state.rag_collection = None
 
     if "langgraph_state" not in st.session_state:
-        st.session_state.langgraph_state = create_initial_state(
-            character=st.session_state.character,
-        )
+        state = create_initial_state(character=st.session_state.character)
+        # 立即注入开场白，确保第一轮 KP 能正确回应
+        scene, goal = get_random_opening()
+        state["scene_context"] = f"{scene}\n\n【你的目标】{goal}"
+        st.session_state.langgraph_state = state
 
     if "memory_manager" not in st.session_state:
         st.session_state.memory_manager = MemoryManager(
@@ -170,11 +191,17 @@ def init_session():
         scene, goal = get_random_opening()
         st.session_state.opening_narrative = scene
         st.session_state.story_goal = goal
-        # 更新初始 state 中的 scene_context（将目标也注入，让 KP 知道故事方向）
-        st.session_state.langgraph_state["scene_context"] = f"{scene}\n\n【你的目标】{goal}"
 
     if "current_suggestions" not in st.session_state:
         st.session_state.current_suggestions = []
+
+    # 处理中标志 —— 防止输入堆积
+    if "processing" not in st.session_state:
+        st.session_state.processing = False
+
+    # 初始化完成标志 —— 确保首轮不会吞输入
+    if "initialized" not in st.session_state:
+        st.session_state.initialized = True
 
 
 # ===================== 侧边栏 =====================
@@ -272,6 +299,7 @@ def render_sidebar():
             key="rule_uploader",
             accept_multiple_files=True,
             help="规则书仅作为 KP 的参考知识，不会改变当前剧情。",
+            disabled=st.session_state.processing,
         )
         if rule_files:
             _handle_rule_uploads(rule_files)
@@ -286,6 +314,7 @@ def render_sidebar():
             key="scenario_uploader",
             accept_multiple_files=True,
             help="上传剧本后 KP 会根据剧本内容重新生成开场白和故事目标。",
+            disabled=st.session_state.processing,
         )
         if scenario_files:
             _handle_scenario_uploads(scenario_files)
@@ -303,7 +332,8 @@ def render_sidebar():
         st.divider()
 
         # ---- 重置按钮 ----
-        if st.button("🔄 重置游戏", use_container_width=True, type="primary"):
+        if st.button("🔄 重置游戏", use_container_width=True, type="primary",
+                     disabled=st.session_state.processing):
             _reset_game()
 
         st.divider()
@@ -313,16 +343,11 @@ def render_sidebar():
 def _index_files(uploaded_files: list, file_type: str) -> list:
     """
     通用文件索引入库函数。返回新索引文件的文本内容列表（供开场生成）。
-
-    参数：
-        uploaded_files : 上传文件列表
-        file_type      : "rule" 或 "scenario"
     """
     import tempfile
 
     session_id = st.session_state.session_id
 
-    # 初始化追踪
     if file_type == "rule":
         tracked_key = "indexed_rule_names"
     else:
@@ -331,7 +356,6 @@ def _index_files(uploaded_files: list, file_type: str) -> list:
     if tracked_key not in st.session_state:
         st.session_state[tracked_key] = set()
 
-    # 创建 ChromaDB Collection
     if st.session_state.rag_collection is None:
         try:
             st.session_state.rag_collection = create_chroma_collection(session_id)
@@ -353,7 +377,6 @@ def _index_files(uploaded_files: list, file_type: str) -> list:
                 tmp.write(uploaded_file.getbuffer())
                 tmp_path = tmp.name
 
-            # 提取文本供 KP 使用
             try:
                 raw_text = parse_file(tmp_path)
                 if raw_text:
@@ -361,7 +384,6 @@ def _index_files(uploaded_files: list, file_type: str) -> list:
             except Exception:
                 pass
 
-            # 入库
             count = index_file(
                 file_path=tmp_path,
                 session_id=session_id,
@@ -393,23 +415,17 @@ def _handle_scenario_uploads(uploaded_files: list):
     new_contents = _index_files(uploaded_files, "scenario")
 
     if new_contents:
-        # 合并所有新上传剧本的内容
         combined = "\n\n---\n\n".join(c[:1500] for c in new_contents[:3])
-        # 标记待生成开场（在 render_main 中处理，确保正确的 Streamlit 渲染流程）
         st.session_state.pending_opening_content = combined[:3000]
 
 
 def _reset_game():
-    """
-    重置游戏：清除对话、重新生成角色、清除 RAG Collection、清除记忆。
-    """
+    """重置游戏。"""
     session_id = st.session_state.session_id
 
-    # 清除记忆（在换 session_id 之前）
     if "memory_manager" in st.session_state:
         st.session_state.memory_manager.clear()
 
-    # 清除 RAG
     if st.session_state.rag_collection is not None:
         clear_collection(session_id)
         st.session_state.rag_collection = None
@@ -417,25 +433,25 @@ def _reset_game():
     st.session_state.indexed_scenario_names = set()
     st.session_state.pop("pending_opening_content", None)
 
-    # 重新生成角色与会话
     new_character = generate_random_character()
     new_session_id = str(uuid.uuid4())
+
+    scene, goal = get_random_opening()
 
     st.session_state.character = new_character
     st.session_state.messages = []
     st.session_state.game_over = False
+    st.session_state.processing = False
     st.session_state.session_id = new_session_id
-    # 随机选取新的开场白与目标
-    scene, goal = get_random_opening()
     st.session_state.opening_narrative = scene
     st.session_state.story_goal = goal
+    st.session_state.current_suggestions = []
 
     st.session_state.langgraph_state = create_initial_state(
         character=new_character,
         scene_context=f"{scene}\n\n【你的目标】{goal}",
     )
 
-    # 重新初始化记忆管理器（新会话）
     st.session_state.memory_manager = MemoryManager(session_id=new_session_id)
 
     st.rerun()
@@ -444,9 +460,7 @@ def _reset_game():
 # ===================== 主区域 =====================
 
 def render_main():
-    """
-    渲染主区域：对话历史 + 输入区域。
-    """
+    """渲染主区域：对话历史 + 输入区域。"""
     st.title("🐙 克苏鲁的呼唤 · AI 守秘人")
     st.caption("你是一名调查员。黑暗中有东西在蠕动……你准备好面对真相了吗？")
 
@@ -473,16 +487,10 @@ def render_main():
 
 
 def _render_chat_history():
-    """
-    渲染对话历史。
-
-    - 无历史消息时显示随机开场白
-    - 使用 st.chat_message 组件 + 自定义 CSS 气泡，兼容浅色/深色主题
-    """
+    """渲染对话历史。"""
     messages = st.session_state.messages
 
     if not messages:
-        # 开场白：场景叙述 + 故事目标
         opening = st.session_state.get("opening_narrative", "")
         goal = st.session_state.get("story_goal", "")
         if not opening:
@@ -498,14 +506,12 @@ def _render_chat_history():
                 f'</div>',
                 unsafe_allow_html=True,
             )
-        # 故事目标以醒目标签展示
         if goal:
             st.info(f"🎯 **你的目标：{goal}**")
 
         st.caption("——你打算怎么做？")
         return
 
-    # 渲染历史消息
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -527,7 +533,6 @@ def _render_chat_history():
                     unsafe_allow_html=True,
                 )
         elif role == "assistant":
-            # 跳过内部标记消息（[KP梗概] / [KP回应]），只显示最终输出
             if "[KP梗概]" in content or "[KP回应]" in content:
                 continue
             with st.chat_message("assistant", avatar="🐙"):
@@ -539,21 +544,11 @@ def _render_chat_history():
                 )
 
 
-
 def _generate_opening_from_upload(content: str, session_id: str):
-    """
-    使用 KP 读取上传剧本内容，生成符合 COC 风格的沉浸式开场白。
-
-    参数：
-        content    : 上传剧本的文本内容
-        session_id : 当前会话 ID
-    """
+    """使用 KP 读取上传剧本内容，生成符合 COC 风格的沉浸式开场白。"""
     from backend.agents import call_kp
 
-    # 取前 2000 字作为参考
     reference_text = content[:2000]
-
-    # 构造角色属性（使用当前角色或默认值）
     char = st.session_state.character
 
     result = call_kp(
@@ -572,21 +567,18 @@ def _generate_opening_from_upload(content: str, session_id: str):
         scene_context="你正在为一场 COC 跑团游戏生成开场白，请基于上传的剧本内容创作。",
     )
 
-    # 使用 KP 生成的内容更新开场白
     opening = result.get("narrative", "")
     kp_response = result.get("kp_response", "")
 
     if opening:
         st.session_state.opening_narrative = opening
-        # 尝试从 kp_response 提取目标
         if kp_response and len(kp_response) > 10:
             st.session_state.story_goal = kp_response
         else:
             st.session_state.story_goal = "根据上传的剧本内容自由探索"
         st.session_state.current_suggestions = result.get("suggestions", [])
-        st.session_state.messages = []  # 清空旧消息，让开场白重新渲染
+        st.session_state.messages = []
 
-        # 更新 scene_context 注入 KP 后续上下文
         scene_ctx = f"【当前剧本背景】\n{reference_text}"
         if st.session_state.get("langgraph_state"):
             st.session_state.langgraph_state["scene_context"] = scene_ctx
@@ -595,13 +587,9 @@ def _generate_opening_from_upload(content: str, session_id: str):
 
 
 def _fallback_opening_from_text(content: str):
-    """
-    降级方案：当 KP 调用失败时，从上传文本中智能提取场景信息。
-    尝试跳过元数据（标题、概述等），找到真正的叙事文本。
-    """
+    """降级方案：当 KP 调用失败时，从上传文本中智能提取场景信息。"""
     raw = content or ""
 
-    # 尝试跳过常见的元数据头部关键词
     skip_patterns = ["剧本概述", "时代背景", "适合人数", "预计时长",
                      "难度", "主题", "第一部分", "====", "----"]
     lines = raw.split("\n")
@@ -627,9 +615,7 @@ def _fallback_opening_from_text(content: str):
 
 
 def _render_input_area():
-    """
-    渲染底部输入区域。
-    """
+    """渲染底部输入区域。处理中时禁用输入防止堆积。"""
     if st.session_state.game_over:
         hp = st.session_state.character.get("HP", 0)
         san = st.session_state.character.get("SAN", 0)
@@ -641,37 +627,78 @@ def _render_input_area():
             st.warning("📖 **故事落幕。** 点击侧边栏「🔄 重置游戏」开启一段新的故事。")
         return
 
+    # 处理中状态：显示进度指示，禁用输入
+    if st.session_state.processing:
+        elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
+        st.markdown(
+            f'<div class="processing-indicator">'
+            f'🐙 <strong>KP 正在编织命运……</strong>'
+            f'<span style="margin-left:auto;opacity:0.7">已等待 {elapsed}s</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        # 渲染当前场景的建议，但不允许交互
+        suggestions = st.session_state.get("current_suggestions", [])
+        if suggestions:
+            st.caption("💡 **你可以这样做：**")
+            cols = st.columns(len(suggestions))
+            for i, (col, sug) in enumerate(zip(cols, suggestions)):
+                col.button(sug, key=f"sug_disabled_{i}", disabled=True, use_container_width=True)
+        return
+
+    # 正常输入
     player_input = st.chat_input(
         placeholder="描述你的行动……（例如：我小心翼翼地推开图书馆的门）",
+        disabled=st.session_state.processing,
     )
 
     if player_input:
         _process_player_input(player_input)
 
+    # 渲染行动建议按钮（非处理中状态）
+    suggestions = st.session_state.get("current_suggestions", [])
+    if suggestions:
+        st.caption("💡 **你可以这样做：**")
+        cols = st.columns(len(suggestions))
+        for i, (col, sug) in enumerate(zip(cols, suggestions)):
+            btn_key = f"sug_{hash(sug)}_{st.session_state.session_id[:6]}_{i}"
+            if col.button(sug, key=btn_key, use_container_width=True):
+                _process_player_input(sug)
+
 
 def _process_player_input(player_input: str):
     """
     处理玩家输入：RAG 检索 → LangGraph 调用 → 流式渲染结果。
+    设置 processing 标志防止输入堆积。
     """
-    # ---- RAG 检索 ----
-    rag_context = ""
-    if st.session_state.rag_collection is not None and st.session_state.embedding_model is not None:
-        try:
-            rag_context = retrieve_context(
-                query=player_input,
-                session_id=st.session_state.session_id,
-                model=st.session_state.embedding_model,
-            )
-        except Exception as e:
-            logger.warning(f"RAG 检索异常: {e}")
+    # 防止重复处理
+    if st.session_state.processing:
+        st.warning("KP 正在处理上一轮请求，请稍候……")
+        return
 
-    # ---- 构建状态 ----
-    state = st.session_state.langgraph_state
-    state["rag_context"] = rag_context
-    state["character"] = st.session_state.character
+    st.session_state.processing = True
+    st.session_state._processing_start = time.time()
 
-    # ---- 调用 LangGraph ----
-    with st.spinner("🐙 KP 正在编织命运……"):
+    try:
+        # ---- RAG 检索 ----
+        rag_context = ""
+        if st.session_state.rag_collection is not None and st.session_state.embedding_model is not None:
+            try:
+                rag_context = retrieve_context(
+                    query=player_input,
+                    session_id=st.session_state.session_id,
+                    model=st.session_state.embedding_model,
+                )
+            except Exception as e:
+                logger.warning(f"RAG 检索异常: {e}")
+
+        # ---- 构建状态 ----
+        state = st.session_state.langgraph_state
+        state["rag_context"] = rag_context
+        state["character"] = st.session_state.character
+
+        # ---- 调用 LangGraph ----
+        t0 = time.time()
         try:
             new_state = run_one_round(
                 graph=st.session_state.graph,
@@ -684,62 +711,61 @@ def _process_player_input(player_input: str):
             logger.error(f"Graph 调用异常: {e}")
             return
 
-    # ---- 更新 Session State ----
-    st.session_state.langgraph_state = new_state
-    st.session_state.character = new_state.get("character", st.session_state.character)
-    st.session_state.game_over = new_state.get("game_over", False)
-    st.session_state.messages = new_state.get("messages", [])
+        elapsed = time.time() - t0
+        logger.info(f"本轮处理耗时: {elapsed:.1f}s")
 
-    # ---- 流式渲染最新输出 ----
-    _stream_render(new_state)
+        # ---- 更新 Session State ----
+        st.session_state.langgraph_state = new_state
+        st.session_state.character = new_state.get("character", st.session_state.character)
+        st.session_state.game_over = new_state.get("game_over", False)
+        st.session_state.messages = new_state.get("messages", [])
 
-    # ---- 保存当前建议到 session state（供 rerun 后渲染） ----
-    st.session_state.current_suggestions = new_state.get("suggestions", [])
+        # ---- 更新当前场景的建议（确保跟随最新场景） ----
+        st.session_state.current_suggestions = new_state.get("suggestions", [])
 
-    # ---- 渲染行动建议按钮 ----
-    _render_suggestions(new_state.get("suggestions", []))
+        # ---- 流式渲染最新输出 ----
+        _stream_render(new_state)
 
-    # ---- 游戏结束：醒目通知 ----
-    if st.session_state.game_over:
-        hp = st.session_state.character.get("HP", 0)
-        san = st.session_state.character.get("SAN", 0)
+        # ---- 游戏结束通知 ----
+        if st.session_state.game_over:
+            hp = st.session_state.character.get("HP", 0)
+            san = st.session_state.character.get("SAN", 0)
+            if hp <= 0:
+                st.toast("💀 调查员已死亡", icon="💀")
+                st.error(
+                    "## 💀 游戏结束 —— 调查员已死亡\n\n"
+                    "世界将永远不知道这里发生了什么……\n\n"
+                    "点击侧边栏「🔄 重置游戏」开始新的冒险。"
+                )
+            elif san <= 0:
+                st.toast("🌀 调查员陷入永久疯狂", icon="🌀")
+                st.error(
+                    "## 🌀 游戏结束 —— 调查员陷入永久疯狂\n\n"
+                    "理智的最后一根弦，已经断了。\n\n"
+                    "点击侧边栏「🔄 重置游戏」开始新的冒险。"
+                )
+            else:
+                st.toast("📖 故事落幕", icon="📖")
+                st.warning(
+                    "## 📖 故事落幕\n\n"
+                    "这段冒险就此画上句号。无论结局是平静还是遗憾，"
+                    "那些无法言说的秘密将永远封存在记忆深处……\n\n"
+                    "点击侧边栏「🔄 重置游戏」开启一段新的故事。"
+                )
 
-        if hp <= 0:
-            st.toast("💀 调查员已死亡", icon="💀")
-            st.error(
-                "## 💀 游戏结束 —— 调查员已死亡\n\n"
-                "世界将永远不知道这里发生了什么……\n\n"
-                "点击侧边栏「🔄 重置游戏」开始新的冒险。"
-            )
-        elif san <= 0:
-            st.toast("🌀 调查员陷入永久疯狂", icon="🌀")
-            st.error(
-                "## 🌀 游戏结束 —— 调查员陷入永久疯狂\n\n"
-                "理智的最后一根弦，已经断了。\n\n"
-                "点击侧边栏「🔄 重置游戏」开始新的冒险。"
-            )
-        else:
-            # 叙事结局：故事自然收束（放弃调查、回归平凡、自然死亡等）
-            st.toast("📖 故事落幕", icon="📖")
-            st.warning(
-                "## 📖 故事落幕\n\n"
-                "这段冒险就此画上句号。无论结局是平静还是遗憾，"
-                "那些无法言说的秘密将永远封存在记忆深处……\n\n"
-                "点击侧边栏「🔄 重置游戏」开启一段新的故事。"
-            )
+    finally:
+        st.session_state.processing = False
+        st.session_state.pop("_processing_start", None)
         st.rerun()
 
 
 def _stream_render(state: dict):
     """
     流式展示本轮新增的输出（不重复渲染历史消息）。
-
-    每轮新增 1 条 system（kp_response/检定结果） + 1 条 assistant（环境渲染）。
-    只取最后出现的这两条，避免收集整个对话历史中的旧 system 消息。
+    使用更快的字符间隔以减少等待感。
     """
     messages = state.get("messages", [])
 
-    # 从后向前取本轮新增的消息
     system_msg = ""
     render_msg = ""
 
@@ -755,64 +781,42 @@ def _stream_render(state: dict):
         elif role == "system" and not system_msg:
             system_msg = content
 
-        # 两个都找到了就停止
         if system_msg and render_msg:
             break
 
-    # 先输出游戏层面回应
+    # 先输出游戏层面回应（较快速度）
     if system_msg:
         with st.chat_message("assistant", avatar="🎲"):
             placeholder = st.empty()
             displayed = ""
+            delay = 0.003 if len(system_msg) > 100 else 0.005  # 长文本快一点
             for char in system_msg:
                 displayed += char
                 placeholder.markdown(
                     f'<div class="chat-message chat-system">{displayed}</div>',
                     unsafe_allow_html=True,
                 )
-                time.sleep(0.006)
+                time.sleep(delay)
 
     # 再输出 KP 环境叙述
     if render_msg:
         with st.chat_message("assistant", avatar="🐙"):
             placeholder = st.empty()
             displayed = ""
+            delay = 0.004 if len(render_msg) > 150 else 0.006
             for char in render_msg:
                 displayed += char
                 placeholder.markdown(
                     f'<div class="chat-message chat-keeper">{displayed}</div>',
                     unsafe_allow_html=True,
                 )
-                time.sleep(0.008)
-
-
-def _render_suggestions(suggestions: list):
-    """
-    在 KP 回复下方渲染行动建议按钮。点击按钮直接作为玩家输入发送。
-    """
-    if not suggestions or st.session_state.game_over:
-        return
-
-    valid = [s for s in suggestions if isinstance(s, str) and s.strip()]
-    if not valid:
-        return
-
-    st.caption("💡 **你可以这样做：**")
-
-    cols = st.columns(len(valid))
-    for i, (col, sug) in enumerate(zip(cols, valid)):
-        # 用随机 key 避免 Streamlit 按钮状态冲突
-        btn_key = f"sug_{hash(sug)}_{st.session_state.session_id[:6]}_{i}"
-        if col.button(sug, key=btn_key, use_container_width=True):
-            _process_player_input(sug)
+                time.sleep(delay)
 
 
 # ===================== 主入口 =====================
 
 def main():
-    """
-    Streamlit 应用主入口。
-    """
+    """Streamlit 应用主入口。"""
     init_session()
     render_sidebar()
     render_main()

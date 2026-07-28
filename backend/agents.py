@@ -2,13 +2,21 @@
 Agent 定义与模型调用模块 —— KP 系统提示词、渲染提示词、LLM 调用封装。
 
 使用 OpenAI 兼容 SDK 调用 DeepSeek API。
+自带超时保护、自动重试、智能模型降级。
 """
 
 import json
-from typing import Any, Dict
+import time
+from typing import Any, Dict, Generator
 
 from openai import OpenAI
-from utils.config import get_openai_client
+from utils.config import (
+    get_openai_client,
+    API_TIMEOUT_SECONDS,
+    API_MAX_RETRIES,
+    KP_MODEL,
+    RENDER_MODEL,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -94,6 +102,61 @@ def _get_client() -> OpenAI:
         raise
 
 
+def _call_with_retry(
+    messages: list,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    description: str = "LLM",
+) -> str:
+    """
+    带超时和重试的 LLM 调用。
+
+    参数：
+        messages     : 消息列表
+        model        : 模型名称
+        temperature  : 温度参数
+        max_tokens   : 最大 token 数
+        description  : 调用描述（用于日志）
+
+    返回：
+        LLM 响应文本。
+
+    异常：
+        RuntimeError : 所有重试均失败
+    """
+    client = _get_client()
+    last_error = None
+
+    for attempt in range(API_MAX_RETRIES + 1):
+        try:
+            t0 = time.time()
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            elapsed = time.time() - t0
+            logger.info(f"{description} 调用成功 (attempt {attempt + 1}, {elapsed:.1f}s)")
+
+            content = response.choices[0].message.content
+            if content is None:
+                raise RuntimeError("LLM 返回空内容")
+            return content.strip()
+
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"{description} 调用失败 (attempt {attempt + 1}/{API_MAX_RETRIES + 1}): {e}")
+
+            if attempt < API_MAX_RETRIES:
+                wait = 2.0 * (attempt + 1)  # 递增等待：2s, 4s
+                logger.info(f"等待 {wait:.0f}s 后重试...")
+                time.sleep(wait)
+
+    raise RuntimeError(f"{description} 调用最终失败（已重试 {API_MAX_RETRIES} 次）: {last_error}")
+
+
 def call_kp(
     player_input: str,
     character: Dict[str, Any],
@@ -103,7 +166,7 @@ def call_kp(
     scene_context: str = "",
 ) -> Dict[str, str]:
     """
-    调用 KP Agent（DeepSeek V4 Pro），生成剧情梗概与检定需求。
+    调用 KP Agent，生成剧情梗概与检定需求。
 
     参数：
         player_input     : 玩家的文字输入
@@ -116,8 +179,6 @@ def call_kp(
     返回：
         {"kp_response": str, "narrative": str, "need_check": str, "difficulty": str}
     """
-    client = _get_client()
-
     # ---------- 构建系统消息 ----------
     character_summary = f"""
 当前角色状态：
@@ -158,19 +219,19 @@ def call_kp(
     messages.append({"role": "user", "content": player_input})
 
     # ---------- 调用 LLM，含 JSON 解析重试 ----------
-    max_retries = 2
-    last_error = None
+    max_json_retries = 2
+    raw_output = None
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(max_json_retries + 1):
         try:
-            response = client.chat.completions.create(
-                model="deepseek-v4-pro",  # DeepSeek V4 Pro
+            raw_output = _call_with_retry(
                 messages=messages,
+                model=KP_MODEL,
                 temperature=0.8,
                 max_tokens=1024,
+                description="KP",
             )
 
-            raw_output = response.choices[0].message.content.strip()
             logger.info(f"KP 原始输出 (attempt {attempt + 1}): {raw_output[:200]}...")
 
             # 尝试解析 JSON
@@ -178,20 +239,22 @@ def call_kp(
             if result:
                 return result
 
-            last_error = f"JSON 解析失败，原始输出: {raw_output[:300]}"
-
             # 重试时在末尾追加格式纠正提示
-            if attempt < max_retries:
-                messages.append({"role": "user", "content": "请严格以 JSON 格式回复，确保可以被 json.loads() 解析。"})
+            if attempt < max_json_retries:
+                messages.append({
+                    "role": "user",
+                    "content": "请严格以 JSON 格式回复，确保可以被 json.loads() 解析。"
+                })
 
-        except Exception as e:
-            last_error = str(e)
+        except RuntimeError as e:
             logger.error(f"KP 调用异常 (attempt {attempt + 1}): {e}")
-            if attempt >= max_retries:
+            if attempt >= max_json_retries:
                 break
+            wait = 2.0 * (attempt + 1)
+            time.sleep(wait)
 
     # 兜底返回
-    logger.error(f"KP 调用最终失败: {last_error}")
+    logger.error(f"KP 调用最终失败，使用兜底回复。原始输出: {str(raw_output)[:200]}")
     return {
         "kp_response": "你环顾四周，暂时没有发现明显的威胁或线索。你可以继续探索、检查身边的物品，或者尝试其他行动。",
         "narrative": "你环顾四周，黑暗中似乎有什么东西在蠕动……但你看不清它的轮廓。空气沉重而潮湿，每一步都伴随着未知的恐惧。",
@@ -204,7 +267,7 @@ def call_kp(
 
 def call_render(narrative: str, check_result: str = "") -> str:
     """
-    调用渲染 Agent（DeepSeek Flash），将剧情梗概润色为沉浸式文本。
+    调用渲染 Agent，将剧情梗概润色为沉浸式文本。
 
     参数：
         narrative    : KP 输出的剧情梗概
@@ -213,30 +276,27 @@ def call_render(narrative: str, check_result: str = "") -> str:
     返回：
         润色后的叙事文本（≤ 200 字）。
     """
+    user_content = f"剧情梗概：{narrative}"
+    if check_result:
+        user_content += f"\n\n检定结果：{check_result}"
+    user_content += "\n\n请将以上内容润色为一段 200 字以内的沉浸式 COC 跑团叙述。"
+
     try:
-        client = _get_client()
-
-        user_content = f"剧情梗概：{narrative}"
-        if check_result:
-            user_content += f"\n\n检定结果：{check_result}"
-        user_content += "\n\n请将以上内容润色为一段 200 字以内的沉浸式 COC 跑团叙述。"
-
-        response = client.chat.completions.create(
-            model="deepseek-v4-flash",  # DeepSeek Flash（使用同一模型，temperature 更低）
+        rendered = _call_with_retry(
             messages=[
                 {"role": "system", "content": RENDER_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
+            model=RENDER_MODEL,
             temperature=0.6,
             max_tokens=512,
+            description="Render",
         )
-
-        rendered = response.choices[0].message.content.strip()
         logger.info(f"Render 输出: {rendered[:200]}...")
         return rendered
 
-    except Exception as e:
-        logger.error(f"Render 调用失败: {e}")
+    except RuntimeError as e:
+        logger.error(f"Render 调用最终失败: {e}")
         # 失败时直接返回原始梗概
         return narrative
 

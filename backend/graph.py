@@ -106,14 +106,24 @@ def kp_node(state: KeeperState) -> KeeperState:
     history = [m for m in clean_messages if m.get("role") != "user" or m["content"] != player_input]
     history = trim_messages(history)
 
+    # 如果是首轮（没有历史消息），在 player_input 前加上场景引导前缀，
+    # 确保 KP 同时理解场景背景和玩家行动意图
+    is_first_round = (not history or len(history) == 0)
+    effective_input = player_input
+    if is_first_round and scene_context:
+        effective_input = (
+            f"【场景背景】\n{scene_context}\n\n"
+            f"【玩家行动 —— 请针对此行动做出回应，不要重复开场白】\n{player_input}"
+        )
+
     # 调用 KP
     kp_result = call_kp(
-        player_input=player_input,
+        player_input=effective_input,
         character=character,
         rag_context=rag_context,
         messages_history=history,
         memory_summary=memory_summary,
-        scene_context=scene_context,
+        scene_context="" if is_first_round else scene_context,  # 首轮已合并到 input 中
     )
 
     logger.info(f"KP 结果: need_check={kp_result['need_check']}, difficulty={kp_result['difficulty']}")
