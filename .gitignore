@@ -1,0 +1,33 @@
+# 环境变量（含密钥）
+.env
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ChromaDB 向量数据库持久化目录
+chroma_db/
+
+# 记忆概括 —— 运行时会话数据（保留 .gitkeep 目录占位）
+data/memory/*
+!data/memory/.gitkeep
+
+# 模型文件
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
