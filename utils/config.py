@@ -18,7 +18,7 @@ load_dotenv()
 
 MAX_CONTEXT_ROUNDS = 5          # 保留最近 N 轮对话
 RAG_TOP_K = 3                   # RAG 检索 Top K 段落
-RAG_SIMILARITY_THRESHOLD = 0.15  # RAG 相似度阈值（all-MiniLM-L6-v2 对中文的余弦相似度偏低，调低阈值）
+RAG_SIMILARITY_THRESHOLD = 0.35  # RAG 相似度阈值（bge-small-zh-v1.5 中文模型相似度更准确）
 
 # ---------- API 超时配置 ----------
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "25"))   # API 单次调用超时（Flash 模型通常 <10s）
@@ -43,7 +43,7 @@ def get_config() -> dict:
     """
     api_key = os.getenv("DEEPSEEK_API_KEY", "")
     base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    embedding_path = os.getenv("EMBEDDING_MODEL_PATH", "./models/all-MiniLM-L6-v2")
+    embedding_path = os.getenv("EMBEDDING_MODEL_PATH", "./models/bge-small-zh-v1.5")
 
     if not api_key:
         raise RuntimeError(

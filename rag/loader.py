@@ -3,7 +3,7 @@ RAG 文件解析与入库模块 —— 将文档分块向量化后存入 ChromaD
 
 支持格式：TXT、PDF（PyPDF2）
 分块策略：500 字符，重叠 50 字符
-向量化模型：sentence-transformers/all-MiniLM-L6-v2
+向量化模型：BAAI/bge-small-zh-v1.5（中文优化，24MB）
 Collection 命名：coc_rag_{session_id}
 """
 
@@ -148,7 +148,7 @@ def create_embedding_model() -> SentenceTransformer:
         SentenceTransformer 实例。
     """
     cfg = get_config()
-    model_path = cfg.get("embedding_model_path", "all-MiniLM-L6-v2")
+    model_path = cfg.get("embedding_model_path", "./models/bge-small-zh-v1.5")
 
     try:
         model = SentenceTransformer(model_path)

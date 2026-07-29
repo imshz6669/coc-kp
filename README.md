@@ -28,7 +28,7 @@
 ┌──────────────┐        ┌──────────────────┐
 │  DeepSeek V4 │        │   RAG 知识库      │
 │   (KP + 渲染) │        │ ChromaDB +       │
-│              │        │ MiniLM-L6-v2      │
+│              │        │ bge-small-zh-v1.5      │
 └──────────────┘        └──────────────────┘
 ```
 
@@ -113,7 +113,7 @@ cp .env.example .env
 
 ```bash
 # 自动从 HuggingFace 下载（需联网）
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-bge-small-zh-v1.5')"
 ```
 
 ### 6. 启动应用
@@ -155,7 +155,7 @@ streamlit run app/main.py
 |---------|------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 | 必填 |
 | `DEEPSEEK_BASE_URL` | DeepSeek API 地址 | `https://api.deepseek.com` |
-| `EMBEDDING_MODEL_PATH` | Embedding 模型路径 | `./models/all-MiniLM-L6-v2` |
+| `EMBEDDING_MODEL_PATH` | Embedding 模型路径 | `./models/all-bge-small-zh-v1.5` |
 
 | 常量 | 说明 | 值 |
 |------|------|-----|

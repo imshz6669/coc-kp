@@ -24,7 +24,17 @@ logger = get_logger(__name__)
 # ===================== 系统提示词 =====================
 
 KP_SYSTEM_PROMPT = """
-你是一名 COC（克苏鲁的呼唤）第七版的 AI 守秘人（Keeper of Arcane Lore），主持一场沉浸式跑团游戏。
+你是一名 COC（克苏鲁的呼唤）第七版的 AI 守秘人（Keeper of Arcane Lore），主持一场沉浸式单人跑团游戏。
+
+## 零、游戏节奏（单人短时跑团）
+
+这是一场单人跑团，目标在 **45-60 分钟内** 完成一个完整故事。这意味着：
+- **压缩场景数量**：整个剧本控制在 4-6 个关键场景，不要展开过多支线。
+- **线索密度加倍**：每个场景至少给出 1-2 条明确的可推进线索，不要让玩家反复试错。
+- **NPC 信息浓缩**：每个 NPC 对话直接给出核心秘密/线索，减少铺垫回合。
+- **主动推进剧情**：玩家卡壳时，通过环境描写主动抛出下一个钩子（奇怪的声音、突然的访客、意外的发现）。
+- **快速收束**：当玩家接近真相时，果断推向高潮和结局，不要拖沓。
+- **检定精简**：只在关键行动上触发检定（撬锁、战斗、抵抗恐惧），普通探索和信息收集直接给结果。
 
 ## 一、你的六大核心职能
 
@@ -54,6 +64,7 @@ KP_SYSTEM_PROMPT = """
 
 - `kp_response`：游戏层面的回应。告诉玩家其行动触发了什么、是否需要检定、有什么选择。口吻中性客观，不带情绪渲染。100字以内。
 - `narrative`：环境渲染文本。用第二人称感官描写呈现玩家此刻看到、听到、闻到、感受到的一切。口吻克制阴冷，不直接命名超自然存在。200字以内。
+- `scene`：当前玩家所处的场景/位置简短名称（6字以内），用于侧边栏进度追踪。例如："茶馆""沈宅前院""地下密室""禁地石碑"。若场景未变化则保持不变。
 - `need_check`：需要检定的属性名，或 "None"。
 - `difficulty`：检定难度（"普通"/"困难"/"极难"）。
 - `story_end`：布尔值。**重要：当玩家明确表达"放弃""结束""不再继续""回归正常生活"等收束意图时，你必须尊重玩家的选择，将 story_end 设为 true 来优雅地结束故事。** 不要反复尝试把玩家拉回剧情。玩家第二次表达同样意图时，必须结束。日常推进行动设为 false。
@@ -63,6 +74,7 @@ KP_SYSTEM_PROMPT = """
 {
   "kp_response": "游戏层面回应文本，告知检定类型/结果/可选行动",
   "narrative": "环境渲染文本，第二人称感官描写",
+  "scene": "当前场景简短名称",
   "need_check": "力量/敏捷/感知/智力/灵感/意志/None",
   "difficulty": "普通/困难/极难",
   "story_end": false,
@@ -256,6 +268,7 @@ def call_kp(
     return {
         "kp_response": "你环顾四周，暂时没有发现明显的威胁或线索。你可以继续探索、检查身边的物品，或者尝试其他行动。",
         "narrative": "你环顾四周，黑暗中似乎有什么东西在蠕动……但你看不清它的轮廓。空气沉重而潮湿，每一步都伴随着未知的恐惧。",
+        "scene": "",
         "need_check": "None",
         "difficulty": "普通",
         "story_end": False,
@@ -357,6 +370,7 @@ def _validate_kp_output(data: Dict) -> Dict[str, str] | None:
     data.setdefault("difficulty", "普通")
     data.setdefault("story_end", False)
     data.setdefault("suggestions", [])
+    data.setdefault("scene", "")
     # kp_response 缺省时用 narrative 的前 100 字代替
     data.setdefault("kp_response", str(data["narrative"])[:100])
 
@@ -369,6 +383,7 @@ def _validate_kp_output(data: Dict) -> Dict[str, str] | None:
     return {
         "kp_response": str(data["kp_response"]),
         "narrative": str(data["narrative"]),
+        "scene": str(data.get("scene", "")),
         "need_check": str(data["need_check"]),
         "difficulty": str(data["difficulty"]),
         "story_end": bool(data["story_end"]),

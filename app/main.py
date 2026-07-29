@@ -760,11 +760,16 @@ def _process_player_input(player_input: str):
         st.session_state.game_over = new_state.get("game_over", False)
         st.session_state.messages = new_state.get("messages", [])
 
-        # ---- 更新当前场景的建议（确保跟随最新场景） ----
+        # ---- 更新当前场景（直接使用 KP 输出的 scene 字段） ----
+        kp_scene = new_state.get("current_scene", "")
+        if kp_scene:
+            st.session_state.current_scene = kp_scene
+
+        # ---- 更新当前轮建议 ----
         st.session_state.current_suggestions = new_state.get("suggestions", [])
 
-        # ---- 自动推断当前场景位置 ----
-        _update_current_scene(new_state, player_input)
+        # ---- 骰子动画（有检定时展示） ----
+        _show_dice_animation(new_state)
 
         # ---- 流式渲染最新输出 ----
         _stream_render(new_state)
@@ -802,54 +807,132 @@ def _process_player_input(player_input: str):
         st.rerun()
 
 
-def _update_current_scene(state: dict, player_input: str):
+def _show_dice_animation(state: dict):
     """
-    从 KP 的回复中自动推断当前场景位置。
-    通过检测常见的场景关键词来追踪玩家进度。
+    有检定时展示骰子动画（CSS 3D 骰子滚动效果）。
+    从最近一条 system 消息中提取检定结果。
     """
-    # 场景关键词映射
-    SCENE_KEYWORDS = [
-        ("码头", "🚢 乌蘅镇码头"),
-        ("茶馆", "🍵 镇上茶馆"),
-        ("沈宅", "🏚 沈家祖宅"),
-        ("沈家", "🏚 沈家祖宅"),
-        ("大门", "🏚 沈家祖宅大门"),
-        ("前院", "🏚 沈家祖宅前院"),
-        ("枯井", "🏚 沈家祖宅前院·枯井"),
-        ("祠堂", "🏛 沈家祠堂"),
-        ("后院", "🏚 沈家祖宅后院"),
-        ("木棺", "⚰ 后院·黑色木棺"),
-        ("黑棺", "⚰ 后院·黑色木棺"),
-        ("密室", "🔮 地下密室"),
-        ("地下", "🔮 地下密室"),
-        ("城隍", "🏚 废弃城隍庙"),
-        ("陈老道", "🏚 废弃城隍庙"),
-        ("石碑", "🗿 禁地石碑"),
-        ("禁地", "🗿 禁地石碑"),
-        ("河眼", "🌊 河眼洞穴"),
-        ("深潭", "🌊 河眼洞穴"),
-        ("洞穴", "🌊 河眼洞穴"),
-        ("镇河录", "📖 获知真相"),
-        ("封印", "✨ 进行封印仪式"),
-        ("契约", "📖 获知真相"),
-    ]
-
     messages = state.get("messages", [])
-    # 从最近的 assistant 消息中搜索场景关键词
-    recent_text = ""
+    # 查找最近一条 system 消息（检定结果）
+    check_result = ""
     for msg in reversed(messages):
-        if msg.get("role") == "assistant" and "[KP梗概]" not in msg.get("content", ""):
-            recent_text = msg.get("content", "")
-            if len(recent_text) > 20:
-                break
-
-    # 也从玩家输入中检测
-    search_text = player_input + " " + recent_text
-
-    for keyword, scene_name in SCENE_KEYWORDS:
-        if keyword in search_text:
-            st.session_state.current_scene = scene_name
+        if msg.get("role") == "system":
+            check_result = msg.get("content", "")
             break
+
+    if not check_result or "检定" not in check_result:
+        return
+
+    # 判断成败
+    is_success = any(w in check_result for w in ["成功", "通过", "大成功"])
+    is_failure = any(w in check_result for w in ["失败", "未通过", "大失败"])
+    is_critical = "大成功" in check_result or "大失败" in check_result
+
+    result_emoji = "🎉" if is_success else "💥"
+    result_text = "成功" if is_success else ("大失败…" if "大失败" in check_result else "失败")
+    result_color = "#4ade80" if is_success else "#ef4444"
+
+    # 提取检定类型和骰值
+    import re
+    attr_match = re.search(r'(\S+)检定', check_result)
+    attr_name = attr_match.group(1) if attr_match else "检定"
+    dice_match = re.search(r'(\d{1,3})\s*/\s*(\d{1,3})', check_result)
+    dice_roll = dice_match.group(1) if dice_match else "?"
+    dice_target = dice_match.group(2) if dice_match else "?"
+
+    dice_html = f"""
+    <style>
+        @keyframes diceRoll {{
+            0% {{ transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg); }}
+            25% {{ transform: rotateX(180deg) rotateY(90deg) rotateZ(45deg); }}
+            50% {{ transform: rotateX(360deg) rotateY(180deg) rotateZ(90deg); }}
+            75% {{ transform: rotateX(540deg) rotateY(270deg) rotateZ(135deg); }}
+            100% {{ transform: rotateX(720deg) rotateY(360deg) rotateZ(0deg); }}
+        }}
+        @keyframes resultPop {{
+            0% {{ transform: scale(0.3); opacity: 0; }}
+            60% {{ transform: scale(1.15); opacity: 1; }}
+            100% {{ transform: scale(1); opacity: 1; }}
+        }}
+        @keyframes pulse {{
+            0%, 100% {{ box-shadow: 0 0 8px VAR_SHADOW; }}
+            50% {{ box-shadow: 0 0 24px VAR_SHADOW, 0 0 48px VAR_SHADOW; }}
+        }}
+        .dice-container {{
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px 20px;
+            margin: 10px 0;
+            background: rgba(30, 30, 45, 0.85);
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.1);
+            animation: pulse 2s infinite;
+            --shadow: {result_color};
+        }}
+        .dice-cube {{
+            width: 64px;
+            height: 64px;
+            perspective: 200px;
+            flex-shrink: 0;
+        }}
+        .dice-inner {{
+            width: 64px;
+            height: 64px;
+            background: linear-gradient(135deg, #1a1a2e, #2d2d44);
+            border: 3px solid {result_color};
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            font-weight: bold;
+            color: {result_color};
+            animation: diceRoll 0.8s ease-out;
+        }}
+        .dice-result {{
+            animation: resultPop 0.4s ease-out 0.7s both;
+        }}
+        .dice-info {{
+            flex: 1;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        }}
+        .dice-attr {{
+            font-size: 0.85rem;
+            color: #9ca3af;
+            margin-bottom: 4px;
+        }}
+        .dice-values {{
+            font-size: 1.1rem;
+            font-weight: bold;
+        }}
+        .dice-target {{ color: #9ca3af; font-size: 0.9rem; }}
+        .dice-outcome {{
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: {result_color};
+            margin-top: 2px;
+        }}
+    </style>
+    <div class="dice-container">
+        <div class="dice-cube">
+            <div class="dice-inner">{result_emoji}</div>
+        </div>
+        <div class="dice-info dice-result">
+            <div class="dice-attr">🎲 {attr_name}检定</div>
+            <div class="dice-values">
+                <span style="color:{result_color}">{dice_roll}</span>
+                <span class="dice-target"> / {dice_target}</span>
+            </div>
+            <div class="dice-outcome">{result_text}</div>
+        </div>
+    </div>
+    """
+
+    # 使用 components.html 渲染（临时容器，渲染后自动消失）
+    import streamlit.components.v1 as components
+    components.html(dice_html, height=130)
 
 
 def _stream_render(state: dict):

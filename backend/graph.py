@@ -58,6 +58,7 @@ class KeeperState(TypedDict):
     memory_summary : 历史记忆摘要文本（注入 KP 系统提示词）
     scene_context  : 当前场景设定（仅在会话开始时有值，用于引导 KP 叙述方向）
     suggestions    : 当前轮的 3 个行动建议（供前端渲染新手引导按钮）
+    current_scene  : 当前场景位置名称（由 KP 输出，供侧边栏进度追踪）
     """
     messages: List[Dict[str, str]]
     character: Dict[str, Any]
@@ -69,6 +70,7 @@ class KeeperState(TypedDict):
     memory_summary: str
     scene_context: str
     suggestions: List[str]
+    current_scene: str
 
 
 # ===================== 节点定义 =====================
@@ -163,6 +165,8 @@ def kp_node(state: KeeperState) -> KeeperState:
 
     # 行动建议（新手引导）
     suggestions = kp_result.get("suggestions", [])
+    # 当前场景（KP 输出，用于侧边栏进度）
+    kp_scene = kp_result.get("scene", "")
 
     return {
         **state,
@@ -173,6 +177,7 @@ def kp_node(state: KeeperState) -> KeeperState:
         },
         "game_over": state.get("game_over", False) or story_end,
         "suggestions": suggestions,
+        "current_scene": kp_scene if kp_scene else state.get("current_scene", ""),
         "rag_context": "",  # 本轮 RAG 上下文已使用完毕
         "scene_context": "",  # 首轮后清除，避免每轮都重复注入
     }
@@ -403,6 +408,7 @@ def create_initial_state(
         "memory_summary": memory_summary,
         "scene_context": scene_context,
         "suggestions": [],
+        "current_scene": "",
     }
 
 
