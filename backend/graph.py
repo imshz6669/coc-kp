@@ -481,4 +481,44 @@ def run_one_round(
         # 更新 state 中的 memory_summary（供下一轮使用）
         result["memory_summary"] = memory_manager.get_context()
 
+        # ---- 消息压缩：利用 memory summary 替代膨胀的历史 ----
+        result = _compress_messages(result, memory_manager)
+
     return result
+
+
+def _compress_messages(state: dict, memory_manager) -> dict:
+    """
+    当记忆概括触发后，压缩消息列表：保留最近 N 轮 + 插入摘要标记。
+    防止消息列表无限膨胀导致 UI 卡顿和 API token 浪费。
+    """
+    from utils.config import MAX_CONTEXT_ROUNDS
+
+    messages = state.get("messages", [])
+    summary = state.get("memory_summary", "")
+
+    # 统计 user 消息数量（= 轮次）
+    user_count = sum(1 for m in messages if m.get("role") == "user")
+    if user_count <= MAX_CONTEXT_ROUNDS + 2:
+        return state  # 轮次还少，不需要压缩
+
+    # 保留最近 MAX_CONTEXT_ROUNDS 轮（从后往前找 N 条 user 消息）
+    kept = []
+    user_seen = 0
+    for msg in reversed(messages):
+        kept.insert(0, msg)
+        if msg.get("role") == "user":
+            user_seen += 1
+            if user_seen >= MAX_CONTEXT_ROUNDS:
+                break
+
+    # 如果有摘要，在最前面插入一条摘要标记（仅用于 UI 展示）
+    if summary and len(summary) > 20:
+        kept.insert(0, {
+            "role": "system",
+            "content": f"📜 前情提要：{summary[:200]}",
+        })
+
+    logger.info(f"消息压缩: {len(messages)} → {len(kept)} 条 (保留最近 {MAX_CONTEXT_ROUNDS} 轮)")
+
+    return {**state, "messages": kept}

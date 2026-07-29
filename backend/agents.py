@@ -137,6 +137,7 @@ def _call_with_retry(
     异常：
         RuntimeError : 所有重试均失败
     """
+    import random
     client = _get_client()
     last_error = None
 
@@ -159,11 +160,23 @@ def _call_with_retry(
 
         except Exception as e:
             last_error = str(e)
-            logger.warning(f"{description} 调用失败 (attempt {attempt + 1}/{API_MAX_RETRIES + 1}): {e}")
+            err_type = type(e).__name__
+
+            # 区分连接错误 vs 其他错误
+            is_conn = any(kw in str(e).lower() for kw in
+                         ['connection', 'timeout', 'reset', 'refused', 'network', 'remote disconnect'])
+
+            logger.warning(
+                f"{description} 调用失败 (attempt {attempt + 1}/{API_MAX_RETRIES + 1}): "
+                f"{err_type}: {str(e)[:120]}"
+            )
 
             if attempt < API_MAX_RETRIES:
-                wait = 2.0 * (attempt + 1)  # 递增等待：2s, 4s
-                logger.info(f"等待 {wait:.0f}s 后重试...")
+                # 连接错误用更长的退避时间（5s/10s），其他错误用 2s/4s
+                base = 5.0 if is_conn else 2.0
+                jitter = random.uniform(0.5, 1.5)  # ±50% 抖动避免惊群
+                wait = base * (attempt + 1) * jitter
+                logger.info(f"等待 {wait:.1f}s 后重试...")
                 time.sleep(wait)
 
     raise RuntimeError(f"{description} 调用最终失败（已重试 {API_MAX_RETRIES} 次）: {last_error}")
@@ -231,10 +244,9 @@ def call_kp(
     messages.append({"role": "user", "content": player_input})
 
     # ---------- 调用 LLM，含 JSON 解析重试 ----------
-    # 简化策略：最多 2 次尝试（1次正常 + 1次格式纠正），不再嵌套 API 重试
     raw_output = None
 
-    for attempt in range(2):  # 最多 2 次
+    for attempt in range(2):  # 最多 2 次（首次 + 格式纠正）
         try:
             raw_output = _call_with_retry(
                 messages=messages,
@@ -248,11 +260,14 @@ def call_kp(
 
             result = _parse_kp_json(raw_output)
             if result:
+                # _parse_kp_json 现在含降级解析（方法4），几乎总能返回有效结果
+                parse_method = "JSON" if result.get("need_check") != "None" or result.get("scene") else "heuristic"
+                logger.info(f"KP 解析成功 ({parse_method}), need_check={result['need_check']}")
                 return result
 
-            # JSON 解析失败，追加格式纠正提示再试一次
+            # JSON 结构解析失败且降级文本太短（<30字），尝试格式纠正
             if attempt == 0:
-                logger.warning("KP JSON 解析失败，追加格式提示后重试...")
+                logger.warning("KP 输出过短或无有效内容，追加格式提示重试...")
                 messages.append({
                     "role": "user",
                     "content": "请严格以 JSON 格式回复，确保可以被 json.loads() 解析。"
@@ -260,11 +275,16 @@ def call_kp(
 
         except RuntimeError as e:
             logger.error(f"KP API 调用失败 (attempt {attempt + 1}): {e}")
-            # API 调用失败直接退出，不重试（_call_with_retry 已经处理了重试）
+            # _call_with_retry 已重试过，这里不再重试
             break
 
-    # 兜底返回
-    logger.error(f"KP 调用最终失败，使用兜底回复。原始输出: {str(raw_output)[:200]}")
+    # 兜底返回：优先尝试从已有文本提取，否则用硬编码
+    if raw_output and len(raw_output) > 30:
+        extracted = _extract_from_narrative(raw_output)
+        logger.warning(f"KP 使用降级提取。原始输出前200字: {raw_output[:200]}")
+        return extracted
+
+    logger.error("KP 调用完全失败，使用硬编码兜底回复。")
     return {
         "kp_response": "你环顾四周，暂时没有发现明显的威胁或线索。你可以继续探索、检查身边的物品，或者尝试其他行动。",
         "narrative": "你环顾四周，黑暗中似乎有什么东西在蠕动……但你看不清它的轮廓。空气沉重而潮湿，每一步都伴随着未知的恐惧。",
@@ -320,8 +340,9 @@ def _parse_kp_json(raw: str) -> Dict[str, str] | None:
 
     支持：
         1. 直接 json.loads()
-        2. 提取 ```json ... ``` 代码块
-        3. 提取 { ... } 最外层花括号
+        2. 提取 ```json ... ``` 代码块（含换行变体）
+        3. 提取 { ... } 最外层花括号（多起点尝试）
+        4. 降级：纯叙事文本时智能提取 narrative + 推断字段
     """
     # 方式 1：直接解析
     try:
@@ -330,29 +351,153 @@ def _parse_kp_json(raw: str) -> Dict[str, str] | None:
     except json.JSONDecodeError:
         pass
 
-    # 方式 2：提取 ```json 代码块
-    if "```json" in raw:
+    # 方式 2：提取 ```json 代码块（兼容换行变体）
+    import re
+    fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
+    if fence_match:
         try:
-            start = raw.index("```json") + 7
-            end = raw.index("```", start)
-            json_str = raw[start:end].strip()
+            json_str = fence_match.group(1).strip()
             data = json.loads(json_str)
             return _validate_kp_output(data)
-        except (ValueError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             pass
 
-    # 方式 3：提取最外层花括号
+    # 方式 3：提取最外层花括号（从后往前找 }，兼容嵌套和叙事前置）
     if "{" in raw and "}" in raw:
-        try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            json_str = raw[start:end]
-            data = json.loads(json_str)
-            return _validate_kp_output(data)
-        except (ValueError, json.JSONDecodeError):
-            pass
+        # 从文本末尾往回找 }，确保是 JSON 的结束花括号
+        last_brace = raw.rindex("}")
+        # 在 } 之前找到配对的 {（从后往前扫描）
+        depth = 0
+        json_start = -1
+        for i in range(last_brace, -1, -1):
+            if raw[i] == "}":
+                depth += 1
+            elif raw[i] == "{":
+                depth -= 1
+                if depth == 0:
+                    json_start = i
+                    break
+        if json_start >= 0:
+            try:
+                json_str = raw[json_start:last_brace + 1]
+                data = json.loads(json_str)
+                return _validate_kp_output(data)
+            except json.JSONDecodeError:
+                # 有时 JSON 内字符串含未转义换行，尝试修复
+                pass
+
+    # 方式 4：降级 —— KP 输出了纯叙事文本无 JSON 结构
+    # 从文本中智能提取 narrative 和 kp_response
+    text = raw.strip()
+    if len(text) > 30:
+        return _extract_from_narrative(text)
 
     return None
+
+
+def _extract_from_narrative(text: str) -> Dict[str, str]:
+    """
+    从纯叙事文本中智能提取字段。
+    当 KP 未输出 JSON 结构时使用。
+
+    策略：
+    - narrative：取完整文本（截断到 250 字）
+    - kp_response：取前 2-3 句作为游戏层面回应
+    - scene：尝试从文中提取地点名词
+    - need_check：检测检定相关关键词
+    - suggestions：从文本推断 3 个合理行动
+    """
+    import re
+
+    # narrative：完整文本（限制长度）
+    narrative = text[:300]
+
+    # kp_response：取前 100 字（通常 KP 会在开头给出游戏层面信息）
+    # 按句号/感叹号/问号分句，取前两句
+    sentences = re.split(r'[。！？]', text)
+    kp_response = ""
+    for s in sentences[:3]:
+        s = s.strip()
+        if len(s) > 5:
+            kp_response += s + "。"
+        if len(kp_response) > 100:
+            break
+    if not kp_response:
+        kp_response = text[:100]
+
+    # scene：尝试匹配常见地点模式
+    scene = ""
+    place_patterns = [
+        r'([\w一-鿿]{1,4}(?:茶馆|码头|祠堂|后院|前院|密室|城隍庙|石碑|深潭|洞穴|客厅|书房|卧室|走廊|地窖|阁楼|酒馆|客栈|寺庙|道观))',
+        r'(?:来到|走进|踏入|到达|回到)([\w一-鿿]{1,6})',
+    ]
+    for pat in place_patterns:
+        m = re.search(pat, text)
+        if m:
+            scene = m.group(1)
+            break
+
+    # need_check：检测检定关键词
+    need_check = "None"
+    difficulty = "普通"
+    check_patterns = [
+        (r'力量|力气|撬|推|搬|举|砸', '力量'),
+        (r'敏捷|跳跃|攀爬|闪避|躲开|快速', '敏捷'),
+        (r'感知|察觉|发现|听到|闻到|注意到|侦查|观察', '感知'),
+        (r'智力|分析|解读|辨认|回忆|知识|研究', '智力'),
+        (r'意志|抵抗|忍住|坚持|精神|勇气', '意志'),
+    ]
+    for pattern, attr in check_patterns:
+        if re.search(pattern, text):
+            need_check = attr
+            break
+
+    # story_end：检测结局信号
+    story_end = bool(re.search(r'封印.*完成|永远.*沉睡|一切.*结束|故事.*落幕|永远.*消失|回归.*平静', text))
+
+    # suggestions：从文本推断
+    suggestions = _infer_suggestions(text)
+
+    logger.info(f"降级解析: 从 {len(text)} 字叙事文本提取字段, scene={scene}, need_check={need_check}")
+    return {
+        "kp_response": kp_response[:100],
+        "narrative": narrative,
+        "scene": scene,
+        "need_check": need_check,
+        "difficulty": difficulty,
+        "story_end": story_end,
+        "suggestions": suggestions,
+    }
+
+
+def _infer_suggestions(text: str) -> list:
+    """从叙事文本推断合理的后续行动建议"""
+    import re
+    suggestions = []
+    keyword_map = [
+        (r'门|大门|入口|房间', '仔细观察周围的环境'),
+        (r'棺|尸体|尸|墓', '检查棺椁的细节和封印'),
+        (r'书|文件|信件|账册|族谱|纸', '仔细翻阅附近的文字记录'),
+        (r'人说|告诉|说道|低声', '继续向此人追问更多细节'),
+        (r'井|地下|密室|暗道|楼梯', '探索通往深处的入口'),
+        (r'符|咒|阵|封印|仪式', '研究这些符文或仪式的含义'),
+        (r'钥匙|锁|铜|开门', '用钥匙打开对应的锁'),
+        (r'潭|水|河|液体|血', '靠近水边仔细观察'),
+        (r'逃|跑|恐惧|害怕|危险', '保持警惕，准备应对突发情况'),
+    ]
+    for pattern, suggestion in keyword_map:
+        if re.search(pattern, text) and suggestion not in suggestions:
+            suggestions.append(suggestion)
+        if len(suggestions) >= 3:
+            break
+
+    # 不足 3 条时补充通用建议
+    defaults = ["仔细观察周围环境", "寻找附近的可疑线索", "与在场的人交谈"]
+    for d in defaults:
+        if d not in suggestions and len(suggestions) < 3:
+            suggestions.append(d)
+
+    return suggestions[:3]
 
 
 def _validate_kp_output(data: Dict) -> Dict[str, str] | None:

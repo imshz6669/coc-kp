@@ -21,8 +21,8 @@ RAG_TOP_K = 3                   # RAG 检索 Top K 段落
 RAG_SIMILARITY_THRESHOLD = 0.35  # RAG 相似度阈值（bge-small-zh-v1.5 中文模型相似度更准确）
 
 # ---------- API 超时配置 ----------
-API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "25"))   # API 单次调用超时（Flash 模型通常 <10s）
-API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "0"))            # 不重试——快速失败比长时间等待更好
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "25"))   # API 单次调用超时
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "2"))            # 重试次数（含首次共 3 次）
 
 # ---------- 模型配置 ----------
 # KP 主力模型（叙事 + 检定判断，需要强创造力）—— 默认 Flash 以加快响应
