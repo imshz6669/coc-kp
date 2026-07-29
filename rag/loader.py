@@ -142,25 +142,51 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
 
 def create_embedding_model() -> SentenceTransformer:
     """
-    加载 embedding 模型。
+    加载 embedding 模型。自动降级：配置路径 → 默认新模型路径 → 在线下载。
 
     返回：
         SentenceTransformer 实例。
     """
+    import os as _os
+
     cfg = get_config()
     model_path = cfg.get("embedding_model_path", "./models/bge-small-zh-v1.5")
 
-    try:
-        model = SentenceTransformer(model_path)
-        logger.info(f"Embedding 模型加载成功: {model_path}")
-        return model
-    except Exception as e:
-        logger.error(f"Embedding 模型加载失败 ({model_path}): {e}")
-        raise RuntimeError(
-            f"无法加载 embedding 模型 '{model_path}'。"
-            f"请确认模型已下载到本地，或网络可访问 HuggingFace。\n"
-            f"错误详情: {e}"
-        )
+    # 候选路径列表：配置值 → 新默认 → 在线模型名
+    candidates = [
+        model_path,
+        "./models/bge-small-zh-v1.5",
+        "BAAI/bge-small-zh-v1.5",
+    ]
+
+    last_error = None
+    for candidate in candidates:
+        # 本地路径检查：路径存在或者是 HuggingFace 模型名（含 /）
+        is_local = "/" not in candidate and not _os.path.isabs(candidate)
+        local_path = candidate if not is_local else None
+        if local_path and not _os.path.exists(local_path):
+            logger.warning(f"模型路径不存在: {candidate}，尝试下一个候选...")
+            continue
+
+        try:
+            model = SentenceTransformer(candidate)
+            logger.info(f"Embedding 模型加载成功: {candidate}")
+            # 如果是从 HF 在线下载的，保存到本地默认路径
+            if "/" in candidate and not _os.path.exists("./models/bge-small-zh-v1.5"):
+                try:
+                    model.save("./models/bge-small-zh-v1.5")
+                    logger.info("模型已缓存到 ./models/bge-small-zh-v1.5")
+                except Exception:
+                    pass
+            return model
+        except Exception as e:
+            last_error = e
+            logger.warning(f"模型加载失败 ({candidate}): {e}")
+
+    raise RuntimeError(
+        f"无法加载 embedding 模型。已尝试: {candidates}。\n"
+        f"最终错误: {last_error}"
+    )
 
 
 def create_chroma_collection(session_id: str) -> chromadb.Collection:
