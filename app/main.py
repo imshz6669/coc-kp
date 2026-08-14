@@ -13,6 +13,7 @@ import os
 import uuid
 import time
 import json
+import copy
 import threading
 
 # 确保项目根目录在 Python 路径中
@@ -32,9 +33,16 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 工作线程结果提交与跳过按钮之间的互斥锁，
-# 防止「跳过已点击但线程仍在提交结果」的竞态
+# 工作线程与脚本上下文之间的通信（模块级，每个 Streamlit 会话独立命名空间）。
+# 工作线程运行在裸线程中、没有 ScriptRunContext，**绝不访问 st.session_state**
+# （云端会话切换/重连时 session_state 访问会抛异常），只读写此 holder。
 _round_lock = threading.Lock()
+_result_holder = {
+    "result": None,    # 工作线程完成后的 new_state 纯字典
+    "error": None,     # 工作线程异常文本
+    "abort": False,    # 跳过/重置中止标志
+    "phase": "",       # 当前阶段指示（检索知识库 / KP 思考与渲染）
+}
 
 # ===================== 页面配置 =====================
 
@@ -213,15 +221,7 @@ def init_session():
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
-    # 后台线程结果传递（异步处理模型）
-    if "_round_result" not in st.session_state:
-        st.session_state._round_result = None
-    if "_round_error" not in st.session_state:
-        st.session_state._round_error = None
-    if "_abort_request" not in st.session_state:
-        st.session_state._abort_request = False
-    if "_phase" not in st.session_state:
-        st.session_state._phase = ""
+    # 后台线程结果经模块级 _result_holder 传递（工作线程不碰 session_state）
 
     # 初始化完成标志
     if "initialized" not in st.session_state:
@@ -455,10 +455,9 @@ def _reset_game():
 
     # 若有后台线程正在处理旧游戏：中止并丢弃其结果，防止旧状态复活
     with _round_lock:
-        st.session_state._abort_request = True
-        st.session_state._round_result = None
-    st.session_state._round_error = None
-    st.session_state._phase = ""
+        _result_holder["abort"] = True
+        _result_holder["result"] = None
+        _result_holder["error"] = None
 
     new_character = generate_random_character()
     new_session_id = str(uuid.uuid4())
@@ -669,10 +668,9 @@ def _render_input_area():
             st.warning("故事落幕。点击侧边栏「重置游戏」开启一段新的故事。", icon=":material/auto_stories:")
         return
 
-    # 处理中或结果待应用：不渲染输入框与建议按钮，从源头杜绝二次提交
-    if (st.session_state.processing
-            or st.session_state.get("_round_result") is not None
-            or st.session_state.get("_round_error")):
+    # 处理中：不渲染输入框与建议按钮，从源头杜绝二次提交
+    # （结果应用后由 _maybe_apply_round_result 置 processing=False）
+    if st.session_state.processing:
         return
 
     # 正常输入
@@ -705,8 +703,11 @@ def _processing_fragment():
     由 _maybe_apply_round_result 在脚本上下文中应用。
     """
     # 结果（或异常）就绪 → 全页重渲染应用
-    if (st.session_state.get("_round_result") is not None
-            or st.session_state.get("_round_error")):
+    with _round_lock:
+        pending = (_result_holder["result"] is not None
+                   or _result_holder["error"] is not None)
+        phase = _result_holder["phase"]
+    if pending:
         st.rerun()
         return
 
@@ -714,7 +715,6 @@ def _processing_fragment():
         return
 
     elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
-    phase = st.session_state.get("_phase", "")
 
     # 注意：st.status 标签必须固定不变（含每秒变化的 elapsed 会导致
     # widget 隐式 key 变化、展开状态被重置），耗时与阶段信息放折叠体内
@@ -730,10 +730,9 @@ def _processing_fragment():
                          help="中断当前请求，KP 会使用降级回复"):
                 # 先声明中止（与工作线程的提交互斥），再注入降级回复
                 with _round_lock:
-                    st.session_state._abort_request = True
-                    st.session_state._round_result = None
-                st.session_state._round_error = None
-                st.session_state._phase = ""
+                    _result_holder["abort"] = True
+                    _result_holder["result"] = None
+                    _result_holder["error"] = None
                 st.session_state.processing = False
                 st.session_state.pop("_processing_start", None)
 
@@ -763,82 +762,103 @@ def _process_player_input(player_input: str):
     结果就绪后由 _maybe_apply_round_result 全页应用。
     processing 标志在本次 rerun 内同步置位，后续独立点击触发的 rerun
     在入口处被拦截，连点不会推两轮剧情。
+
+    关键设计：工作线程运行在裸线程中，绝不访问 st.session_state
+    （云端会话切换/重连时会抛异常），此处先在脚本上下文中把所需
+    对象快照为纯 Python 对象传入线程。
     """
     # 防止重复处理（异步模型下此 guard 真正生效：处理中标志跨 rerun 可见）
     if st.session_state.processing:
         return
 
+    snapshot = {
+        "player_input": player_input,
+        "graph": st.session_state.graph,
+        "state": copy.deepcopy(st.session_state.langgraph_state),
+        "character": copy.deepcopy(st.session_state.character),
+        "memory_manager": st.session_state.memory_manager,
+        "session_id": st.session_state.session_id,
+        "rag_collection": st.session_state.rag_collection,
+        "embedding_model": st.session_state.embedding_model,
+    }
+
+    with _round_lock:
+        _result_holder["result"] = None
+        _result_holder["error"] = None
+        _result_holder["abort"] = False
+        _result_holder["phase"] = ""
+
     st.session_state.processing = True
     st.session_state._processing_start = time.time()
-    st.session_state._abort_request = False
-    st.session_state._round_result = None
-    st.session_state._round_error = None
-    st.session_state._phase = ""
 
     worker = threading.Thread(
         target=_run_round_worker,
-        args=(player_input,),
+        args=(snapshot,),
         name="coc-round-worker",
         daemon=True,
     )
     worker.start()
 
 
-def _run_round_worker(player_input: str):
+def _run_round_worker(snapshot: dict):
     """
     后台工作线程：RAG 检索 + LangGraph 调用（阻塞 10-40 秒）。
 
-    完成后在锁内检查中止标志，被跳过/重置则丢弃结果；
-    未跳过才写入 _round_result，由 fragment 检测并触发全页应用。
+    线程内只读写快照与模块级 _result_holder（锁保护），
+    不访问 st.session_state。完成后检查中止标志，
+    被跳过/重置则丢弃结果；未跳过才提交结果，
+    由 fragment 检测并触发全页应用。
     """
     try:
         # ---- RAG 检索 ----
         rag_context = ""
-        if (st.session_state.rag_collection is not None
-                and st.session_state.embedding_model is not None):
+        if (snapshot["rag_collection"] is not None
+                and snapshot["embedding_model"] is not None):
             try:
-                st.session_state._phase = "检索知识库"
+                with _round_lock:
+                    _result_holder["phase"] = "检索知识库"
                 rag_context = retrieve_context(
-                    query=player_input,
-                    session_id=st.session_state.session_id,
-                    model=st.session_state.embedding_model,
+                    query=snapshot["player_input"],
+                    session_id=snapshot["session_id"],
+                    model=snapshot["embedding_model"],
                 )
             except Exception as e:
                 logger.warning(f"RAG 检索异常: {e}")
 
         # ---- 构建状态 ----
-        state = st.session_state.langgraph_state
+        state = snapshot["state"]
         state["rag_context"] = rag_context
-        state["character"] = st.session_state.character
+        state["character"] = snapshot["character"]
 
         # ---- 调用 LangGraph（KP 思考 + 渲染 + 记忆整理均在此内） ----
-        st.session_state._phase = "KP 思考与渲染"
+        with _round_lock:
+            _result_holder["phase"] = "KP 思考与渲染"
         t0 = time.time()
         new_state = run_one_round(
-            graph=st.session_state.graph,
+            graph=snapshot["graph"],
             state=state,
-            player_input=player_input,
-            memory_manager=st.session_state.memory_manager,
+            player_input=snapshot["player_input"],
+            memory_manager=snapshot["memory_manager"],
         )
         elapsed = time.time() - t0
         logger.info(f"本轮处理耗时: {elapsed:.1f}s")
 
         # ---- 与跳过按钮互斥：被中止则丢弃结果 ----
         with _round_lock:
-            if st.session_state.get("_abort_request"):
+            if _result_holder["abort"]:
                 logger.info("本轮结果已被用户跳过，丢弃。")
                 return
-            st.session_state._round_result = new_state
+            _result_holder["result"] = new_state
 
     except Exception as e:
         logger.error(f"Graph 调用异常: {e}")
         with _round_lock:
-            if not st.session_state.get("_abort_request"):
-                st.session_state._round_error = str(e)
+            if not _result_holder["abort"]:
+                _result_holder["error"] = str(e)
 
     finally:
-        st.session_state.processing = False
-        st.session_state.pop("_processing_start", None)
+        with _round_lock:
+            _result_holder["phase"] = ""
 
 
 def _maybe_apply_round_result():
@@ -847,15 +867,22 @@ def _maybe_apply_round_result():
     更新 session state → 骰子动画 → 打字流 → 游戏结束通知。
     每次全页重渲染时检查一次，无待应用结果时立即返回。
     """
-    result = st.session_state.get("_round_result")
+    with _round_lock:
+        result = _result_holder["result"]
+        error = _result_holder["error"]
+        _result_holder["result"] = None
+        _result_holder["error"] = None
+
     if result is None:
-        err = st.session_state.get("_round_error")
-        if err:
-            st.session_state._round_error = None
-            st.error(f"系统异常: {err}")
+        if error:
+            st.session_state.processing = False
+            st.session_state.pop("_processing_start", None)
+            st.error(f"系统异常: {error}")
         return
 
-    st.session_state._round_result = None
+    # 结果应用后恢复正常输入
+    st.session_state.processing = False
+    st.session_state.pop("_processing_start", None)
 
     # ---- 更新 Session State ----
     st.session_state.langgraph_state = result
