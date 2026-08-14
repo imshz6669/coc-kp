@@ -3,26 +3,18 @@ RAG 检索器模块 —— 将玩家输入向量化，检索 Top K 相似段落�
 
 提供：
     - retrieve_context() : 检索与玩家输入最相关的知识库片段
+
+注意：chromadb 在函数内懒加载（与 loader.py 保持一致），
+顶层导入保持轻量，保证 app 主流程在任何环境下都能启动。
 """
 
-from typing import List
+from __future__ import annotations
 
-import chromadb
-from chromadb.api.types import EmbeddingFunction
-from sentence_transformers import SentenceTransformer
+from typing import List
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-class _NoOpEmbedding(EmbeddingFunction):
-    """空 embedding，阻止 ChromaDB 自动下载模型。"""
-    def __init__(self):
-        pass
-
-    def __call__(self, input):
-        return [[0.0]] * len(input)
 
 from utils.config import RAG_TOP_K, RAG_SIMILARITY_THRESHOLD
 
@@ -47,7 +39,7 @@ def _dist_to_similarity(dist: float, space: str = "l2") -> float:
 def retrieve_context(
     query: str,
     session_id: str,
-    model: SentenceTransformer,
+    model,
     top_k: int = RAG_TOP_K,
     threshold: float = RAG_SIMILARITY_THRESHOLD,
 ) -> str:
@@ -71,6 +63,8 @@ def retrieve_context(
 
     # 尝试获取 Collection
     try:
+        import chromadb
+
         client = chromadb.PersistentClient(path="./chroma_db")
         collection = client.get_collection(collection_name)
     except Exception:

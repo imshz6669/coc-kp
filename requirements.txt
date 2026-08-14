@@ -1,7 +1,9 @@
-streamlit>=1.28.0
-langgraph>=0.0.20
-chromadb>=0.4.0
-sentence-transformers>=2.2.0
-PyPDF2>=3.0.0
-python-dotenv>=1.0.0
-openai>=1.0.0
+# 锁定为本地验证过的版本，保证 Streamlit Cloud 与本地行为一致。
+# 注意：torch / numpy / transformers 为传递依赖，交由 pip 按平台解析，勿在此锁定。
+streamlit==1.60.0
+langgraph==1.2.9
+chromadb==1.5.9
+sentence-transformers==5.6.1
+PyPDF2==3.0.1
+python-dotenv==1.2.2
+openai==2.48.0

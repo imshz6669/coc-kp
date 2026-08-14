@@ -7,25 +7,33 @@ RAG 文件解析与入库模块 —— 将文档分块向量化后存入 ChromaD
 Collection 命名：coc_rag_{session_id}
 """
 
+from __future__ import annotations
+
 import os
 import uuid
 import time
 from datetime import datetime
 from typing import List
 
-import chromadb
-from chromadb.api.types import EmbeddingFunction
-from sentence_transformers import SentenceTransformer
-
 from utils.config import get_config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 注意：chromadb / sentence_transformers（拉 torch，体量大、平台相关）
+# 一律在函数内部懒加载。顶层导入保持轻量，保证 app 主流程
+# （from rag.loader import ...）在任何环境下都能成功，
+# RAG 栈异常时降级为「RAG 不可用」，不影响游戏本体。
 
-# ===================== 空 Embedding 函数 =====================
 
-class _NoOpEmbedding(EmbeddingFunction):
+def _get_chroma_client():
+    """懒加载 ChromaDB PersistentClient。"""
+    import chromadb
+
+    return chromadb.PersistentClient(path="./chroma_db")
+
+
+def _make_noop_embedding():
     """
     空操作 embedding 函数 —— 阻止 ChromaDB 自动下载 ONNX 模型。
 
@@ -33,11 +41,16 @@ class _NoOpEmbedding(EmbeddingFunction):
     所有向量通过 collection.add(embeddings=...) 显式传入，
     ChromaDB 的内置 embedding 从未被使用。
     """
-    def __init__(self):
-        pass
+    from chromadb.api.types import EmbeddingFunction
 
-    def __call__(self, input):
-        return [[0.0]] * len(input)
+    class _NoOpEmbedding(EmbeddingFunction):
+        def __init__(self):
+            pass
+
+        def __call__(self, input):
+            return [[0.0]] * len(input)
+
+    return _NoOpEmbedding()
 
 
 # ===================== 文本解析 =====================
@@ -142,13 +155,15 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
 
 # ===================== 向量化与入库 =====================
 
-def create_embedding_model() -> SentenceTransformer:
+def create_embedding_model():
     """
     加载 embedding 模型。自动降级：配置路径 → 默认新模型路径 → 在线下载。
 
     返回：
         SentenceTransformer 实例。
     """
+    from sentence_transformers import SentenceTransformer
+
     import os as _os
 
     cfg = get_config()
@@ -206,7 +221,7 @@ def create_chroma_collection(session_id: str) -> chromadb.Collection:
     collection_name = f"coc_rag_{session_id}"
 
     try:
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = _get_chroma_client()
 
         # 删除同名旧 Collection（如果存在）
         try:
@@ -216,7 +231,7 @@ def create_chroma_collection(session_id: str) -> chromadb.Collection:
 
         collection = client.create_collection(
             name=collection_name,
-            embedding_function=_NoOpEmbedding(),
+            embedding_function=_make_noop_embedding(),
             # 显式指定余弦空间：bge 模型向量按余弦相似度检索（官方要求），
             # 不再依赖 PersistentClient 默认的 L2 距离。
             # created_at 供 cleanup_stale_collections 做年龄判定。
@@ -298,7 +313,7 @@ def clear_collection(session_id: str) -> bool:
     collection_name = f"coc_rag_{session_id}"
 
     try:
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = _get_chroma_client()
         client.delete_collection(collection_name)
         logger.info(f"Collection 已删除: {collection_name}")
         return True
@@ -333,6 +348,8 @@ def cleanup_stale_collections(
     """
     if not os.path.isdir(db_path):
         return 0
+
+    import chromadb
 
     client = chromadb.PersistentClient(path=db_path)
     try:

@@ -262,12 +262,23 @@ for _ in range(50):
     assert 1 <= sanity_loss_roll("神话") <= 100
 check("sanity_loss_roll ranges (50 samples each)", True)
 
-# Tool integration
+# Tool integration（损失 ≥5 触发真实智力检定：mock 掷骰保证确定性）
+import backend.tools as tools_module
+_orig_roll = tools_module.roll_d100
+
 char_san = {**char}
+tools_module.roll_d100 = lambda: 10  # 掷出 10 ≤ INT，检定成功 → 临时疯狂
 result = execute_tool("sanity_loss", {"loss": 6, "reason": "目睹怪物"}, char_san)
 updated = result["updated_character"]
 check("sanity tool: SAN 50->44", updated["SAN"] == 44)
-check("sanity tool: temp_insanity=True", updated["temp_insanity"])
+check("sanity tool: temp_insanity=True (INT检定成功)", updated["temp_insanity"])
+
+char_san2 = {**char}
+tools_module.roll_d100 = lambda: 95  # 掷出 95 > INT，检定失败 → 压抑
+result2 = execute_tool("sanity_loss", {"loss": 6, "reason": "目睹怪物"}, char_san2)
+check("sanity tool: temp_insanity=False (INT检定失败)", result2["updated_character"]["temp_insanity"] is False)
+
+tools_module.roll_d100 = _orig_roll
 
 
 # ================================================================
