@@ -36,13 +36,20 @@ logger = get_logger(__name__)
 # 工作线程与脚本上下文之间的通信（模块级，每个 Streamlit 会话独立命名空间）。
 # 工作线程运行在裸线程中、没有 ScriptRunContext，**绝不访问 st.session_state**
 # （云端会话切换/重连时 session_state 访问会抛异常），只读写此 holder。
-_round_lock = threading.Lock()
-_result_holder = {
-    "result": None,    # 工作线程完成后的 new_state 纯字典
-    "error": None,     # 工作线程异常文本
-    "abort": False,    # 跳过/重置中止标志
-    "phase": "",       # 当前阶段指示（检索知识库 / KP 思考与渲染）
-}
+#
+# 关键：Streamlit 每次整页重跑都会重新执行模块顶层代码，普通的
+# `_result_holder = {...}` 赋值会把 holder 重新绑定为空字典、把锁换成
+# 新对象（工作线程与脚本将持有两把不同的锁）。因此用「globals 中已
+# 存在则不重建」的守卫保住跨重跑状态。
+if "_round_lock" not in globals():
+    _round_lock = threading.Lock()
+if "_result_holder" not in globals():
+    _result_holder = {
+        "result": None,    # 工作线程完成后的 new_state 纯字典
+        "error": None,     # 工作线程异常文本
+        "abort": False,    # 跳过/重置中止标志
+        "phase": "",       # 当前阶段指示（检索知识库 / KP 思考与渲染）
+    }
 
 # ===================== 页面配置 =====================
 
@@ -197,11 +204,17 @@ def init_session():
         st.session_state.rag_collection = None
 
     if "langgraph_state" not in st.session_state:
-        state = create_initial_state(character=st.session_state.character)
-        # 立即注入开场白，确保第一轮 KP 能正确回应
+        # 只抽取一次开场：同一场景同时用于 KP 场景上下文与玩家可见开场白。
+        # （曾在此处与下方 opening_narrative 各自抽取一次，两个独立随机数
+        # 会导致玩家看到的开场与 KP 实际推进的剧本不一致。）
         scene, goal = get_random_opening()
-        state["scene_context"] = f"{scene}\n\n【你的目标】{goal}"
+        state = create_initial_state(
+            character=st.session_state.character,
+            scene_context=f"{scene}\n\n【你的目标】{goal}",
+        )
         st.session_state.langgraph_state = state
+        st.session_state.opening_narrative = scene
+        st.session_state.story_goal = goal
 
     if "memory_manager" not in st.session_state:
         st.session_state.memory_manager = MemoryManager(
@@ -210,6 +223,7 @@ def init_session():
         logger.info(f"MemoryManager 初始化: {st.session_state.session_id[:8]}...")
 
     if "opening_narrative" not in st.session_state:
+        # 兜底分支（正常流程已在 langgraph_state 初始化时一并写入）
         scene, goal = get_random_opening()
         st.session_state.opening_narrative = scene
         st.session_state.story_goal = goal
