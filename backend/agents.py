@@ -174,17 +174,21 @@ def _call_with_retry(
             if content is None:
                 raise RuntimeError("LLM 返回空内容")
 
-            # 输出被 max_tokens 截断：翻倍 token 上限重试，避免语句半截
+            # 输出被 max_tokens 截断：仅允许一次翻倍重试（重试整段生成
+            # 代价大、延迟高），再截断则直接返回交由句界裁剪处理
             finish_reason = getattr(response.choices[0], "finish_reason", None)
-            if finish_reason == "length" and attempt < API_MAX_RETRIES:
-                new_max = min(max_tokens * 2, 4096)
+            if finish_reason == "length" and max_tokens < 2048:
+                new_max = min(max_tokens * 2, 2048)
                 logger.warning(
                     f"{description} 输出被截断 (finish_reason=length)，"
-                    f"以 max_tokens={new_max} 重试..."
+                    f"以 max_tokens={new_max} 重试（仅一次）..."
                 )
                 max_tokens = new_max
                 time.sleep(1.0)
                 continue
+
+            if finish_reason == "length":
+                logger.warning(f"{description} 输出仍被截断，交由句界裁剪处理。")
 
             return content.strip()
 
@@ -282,7 +286,9 @@ def call_kp(
                 messages=messages,
                 model=KP_MODEL,
                 temperature=0.8,
-                max_tokens=1024,
+                # 协议扩展（伤害/理智字段 + 裁决指南）后输出变长，
+                # 提高上限避免频繁触发截断重试拖慢响应
+                max_tokens=1536,
                 description=f"KP(attempt {attempt + 1})",
             )
 
@@ -354,7 +360,7 @@ def call_render(narrative: str, check_result: str = "") -> str:
             ],
             model=RENDER_MODEL,
             temperature=0.6,
-            max_tokens=512,
+            max_tokens=768,
             description="Render",
         )
         logger.info(f"Render 输出: {rendered[:200]}...")

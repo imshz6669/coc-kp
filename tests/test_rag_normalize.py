@@ -178,36 +178,35 @@ class FakeClient:
 
 orig_get_client = agents_module._get_client
 
-# 场景 A：前两次 length，第三次 stop → 成功，max_tokens 逐次翻倍
+# 场景 A：1024 起步，第一次截断 → 2048 重试一次，再截断 → 直接返回
+# （整段重新生成代价大，交由上游句界裁剪，避免几十秒延迟）
 fake = FakeClient(["length", "length", "stop"], ["截断内容A", "截断内容B", "完整内容"])
 agents_module._get_client = lambda: fake
 result = _call_with_retry(messages=[], model="test", temperature=0.7,
                           max_tokens=1024, description="fake")
-check("返回第三次完整内容", result == "完整内容", result)
-check("调用 3 次", len(fake.calls) == 3, f"calls={len(fake.calls)}")
-check("max_tokens 1024 → 2048 → 4096",
-      [c["max_tokens"] for c in fake.calls] == [1024, 2048, 4096],
+check("第二次截断直接返回（仅一次翻倍重试）", result == "截断内容B", result)
+check("调用 2 次", len(fake.calls) == 2, f"calls={len(fake.calls)}")
+check("max_tokens 1024 → 2048",
+      [c["max_tokens"] for c in fake.calls] == [1024, 2048],
       str([c["max_tokens"] for c in fake.calls]))
 
-# 场景 B：全部 length → 最终返回截断内容（交给上游规范化裁剪），不抛异常
-# 重试上限 3 次调用：512 → 1024 → 2048，每次翻倍
+# 场景 B：512 起步，两次翻倍后达到 2048 上限直接返回，不抛异常
 fake2 = FakeClient(["length"] * 4, ["截断内容"] * 4)
 agents_module._get_client = lambda: fake2
 result2 = _call_with_retry(messages=[], model="test", temperature=0.7,
                            max_tokens=512, description="fake")
 check("全截断时不抛异常", result2 == "截断内容", result2)
-check("max_tokens 逐次翻倍至调用上限",
+check("max_tokens 512 → 1024 → 2048",
       [c["max_tokens"] for c in fake2.calls] == [512, 1024, 2048],
       str([c["max_tokens"] for c in fake2.calls]))
 
-# 场景 B2：大上限下封顶 4096（2048 → 4096 → 4096）
+# 场景 B2：2048 起步已到上限，截断直接返回（仅 1 次调用）
 fake2b = FakeClient(["length"] * 4, ["截断内容"] * 4)
 agents_module._get_client = lambda: fake2b
-_call_with_retry(messages=[], model="test", temperature=0.7,
-                 max_tokens=2048, description="fake")
-check("max_tokens 封顶 4096",
-      [c["max_tokens"] for c in fake2b.calls] == [2048, 4096, 4096],
-      str([c["max_tokens"] for c in fake2b.calls]))
+result2b = _call_with_retry(messages=[], model="test", temperature=0.7,
+                            max_tokens=2048, description="fake")
+check("已达上限不再重试（1 次调用）", result2b == "截断内容" and len(fake2b.calls) == 1,
+      f"calls={len(fake2b.calls)}")
 
 # 场景 C：正常 stop → 一次调用完成
 fake3 = FakeClient(["stop"], ["正常内容"])

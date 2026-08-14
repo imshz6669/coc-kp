@@ -220,6 +220,8 @@ def init_session():
         st.session_state._round_error = None
     if "_abort_request" not in st.session_state:
         st.session_state._abort_request = False
+    if "_phase" not in st.session_state:
+        st.session_state._phase = ""
 
     # 初始化完成标志
     if "initialized" not in st.session_state:
@@ -456,6 +458,7 @@ def _reset_game():
         st.session_state._abort_request = True
         st.session_state._round_result = None
     st.session_state._round_error = None
+    st.session_state._phase = ""
 
     new_character = generate_random_character()
     new_session_id = str(uuid.uuid4())
@@ -711,8 +714,18 @@ def _processing_fragment():
         return
 
     elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
-    with st.status(f"KP 正在编织命运（已等待 {elapsed}s）", state="running"):
-        if elapsed >= 15:
+    phase = st.session_state.get("_phase", "")
+
+    # 注意：st.status 标签必须固定不变（含每秒变化的 elapsed 会导致
+    # widget 隐式 key 变化、展开状态被重置），耗时与阶段信息放折叠体内
+    with st.status("KP 正在编织命运", state="running"):
+        phase_text = f" · {phase}" if phase else ""
+        st.caption(f"已等待 {elapsed}s{phase_text}")
+
+    # 跳过按钮放在 status 折叠体之外，无需展开即可点击
+    if elapsed >= 15:
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
             if st.button("跳过等待", key="skip_wait", icon=":material/skip_next:",
                          help="中断当前请求，KP 会使用降级回复"):
                 # 先声明中止（与工作线程的提交互斥），再注入降级回复
@@ -720,6 +733,7 @@ def _processing_fragment():
                     st.session_state._abort_request = True
                     st.session_state._round_result = None
                 st.session_state._round_error = None
+                st.session_state._phase = ""
                 st.session_state.processing = False
                 st.session_state.pop("_processing_start", None)
 
@@ -737,9 +751,8 @@ def _processing_fragment():
                     "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
                 ]
                 st.rerun()
+        with col_b:
             st.caption("KP 正在生成回复，请耐心等待，若超过 30 秒建议跳过")
-        else:
-            st.caption("KP 正在编织剧情，请稍候……")
 
 
 def _process_player_input(player_input: str):
@@ -760,6 +773,7 @@ def _process_player_input(player_input: str):
     st.session_state._abort_request = False
     st.session_state._round_result = None
     st.session_state._round_error = None
+    st.session_state._phase = ""
 
     worker = threading.Thread(
         target=_run_round_worker,
@@ -783,6 +797,7 @@ def _run_round_worker(player_input: str):
         if (st.session_state.rag_collection is not None
                 and st.session_state.embedding_model is not None):
             try:
+                st.session_state._phase = "检索知识库"
                 rag_context = retrieve_context(
                     query=player_input,
                     session_id=st.session_state.session_id,
@@ -796,7 +811,8 @@ def _run_round_worker(player_input: str):
         state["rag_context"] = rag_context
         state["character"] = st.session_state.character
 
-        # ---- 调用 LangGraph ----
+        # ---- 调用 LangGraph（KP 思考 + 渲染 + 记忆整理均在此内） ----
+        st.session_state._phase = "KP 思考与渲染"
         t0 = time.time()
         new_state = run_one_round(
             graph=st.session_state.graph,
