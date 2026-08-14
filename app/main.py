@@ -702,8 +702,9 @@ def _process_player_input(player_input: str):
     if st.session_state.processing:
         return
 
-    # 上一轮刚完成（3 秒内）：拦截排队中的连点
-    if time.time() - st.session_state.get("_last_round_done", 0.0) < 3:
+    # 上一轮刚完成（2 秒内）：拦截排队中的连点，并给出提示
+    if time.time() - st.session_state.get("_last_round_done", 0.0) < 2:
+        st.toast("操作太快了，请稍候片刻再行动", icon=":material/hourglass_empty:")
         return
 
     st.session_state.processing = True
