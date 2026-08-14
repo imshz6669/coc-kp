@@ -43,100 +43,103 @@ st.set_page_config(
 )
 
 # ===================== 自定义 CSS =====================
+# 仅保留 config.toml 主题无法覆盖的部分：
+#   1. 聊天气泡「三声部字体系统」（KP 衬线 / 玩家无衬线 / 系统等宽）
+#   2. 骰子动画（st.html 内联渲染，见 _show_dice_animation）
+# 颜色全部与 .streamlit/config.toml 保持一致，不在此处另行定义基调色。
 
 st.markdown("""
 <style>
-    /* ========== 聊天气泡 ========== */
+    /* ========== 聊天气泡：三声部字体 ==========
+       KP 叙述 = 衬线（旧书口吻） / 玩家 = 无衬线（现代之口） / 系统与骰子 = 等宽 */
     .chat-message {
-        padding: 0.9rem 1.1rem;
-        border-radius: 12px;
-        margin-bottom: 0.6rem;
-        line-height: 1.75;
+        padding: 0.85rem 1.1rem;
+        border-radius: 6px;
+        margin-bottom: 0.5rem;
+        line-height: 1.8;
         font-size: 0.95rem;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
-        transition: box-shadow 0.2s ease;
+        background: rgba(217, 207, 188, 0.03);
+        border-left: 3px solid;
     }
-    .chat-message:hover {
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-    }
-    /* 调查员消息 —— 冷调蓝 */
     .chat-player {
-        background: rgba(74, 158, 255, 0.07);
-        border-left: 4px solid rgba(74, 158, 255, 0.7);
+        border-left-color: #7D99AE;
+        font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
     }
-    /* KP 消息 —— 暖紫 */
     .chat-keeper {
-        background: rgba(192, 132, 252, 0.07);
-        border-left: 4px solid rgba(192, 132, 252, 0.7);
+        border-left-color: #C89B5A;
+        font-family: 'Noto Serif SC', 'STZhongsong', 'SimSun', serif;
     }
-    /* 系统 / KP 提示消息 —— 冷灰调信息条 */
     .chat-system {
-        background: rgba(160, 175, 190, 0.08);
-        border-left: 4px solid rgba(140, 155, 170, 0.65);
-        font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-        font-size: 0.9rem;
+        border-left-color: #8A8175;
+        font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+        font-size: 0.88rem;
     }
-    /* ========== 状态徽章 ========== */
-    .status-badge {
-        display: inline-block;
-        padding: 0.2rem 0.6rem;
-        border-radius: 4px;
-        font-size: 0.8rem;
-        font-weight: bold;
+    /* ========== 骰子动画 ========== */
+    @keyframes diceRoll {
+        0%   { transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg); }
+        25%  { transform: rotateX(180deg) rotateY(90deg) rotateZ(45deg); }
+        50%  { transform: rotateX(360deg) rotateY(180deg) rotateZ(90deg); }
+        75%  { transform: rotateX(540deg) rotateY(270deg) rotateZ(135deg); }
+        100% { transform: rotateX(720deg) rotateY(360deg) rotateZ(0deg); }
     }
-    .status-alive { background: #166534; color: #4ade80; }
-    .status-dead  { background: #7f1d1d; color: #fca5a5; }
-    .status-insane { background: #4a1d7f; color: #c084fc; }
-    /* ========== 侧边栏属性面板 ========== */
-    .attr-row {
-        display: flex;
-        justify-content: space-between;
-        padding: 0.3rem 0;
-        border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+    @keyframes resultPop {
+        0%   { transform: scale(0.3); opacity: 0; }
+        60%  { transform: scale(1.15); opacity: 1; }
+        100% { transform: scale(1); opacity: 1; }
     }
-    .attr-label { color: #9ca3af; }
-    .attr-value { font-weight: bold; }
-    .attr-danger { color: #ef4444 !important; }
-    /* ========== 行动建议按钮 ========== */
-    .suggestion-container {
-        display: flex;
-        gap: 0.5rem;
-        flex-wrap: wrap;
-        margin: 0.8rem 0 0.5rem 0;
+    @keyframes diceGlow {
+        0%, 100% { box-shadow: 0 0 8px var(--dice); }
+        50%      { box-shadow: 0 0 20px var(--dice), 0 0 40px var(--dice); }
     }
-    .suggestion-btn {
-        flex: 1;
-        min-width: 120px;
-        padding: 0.5rem 0.8rem;
-        border: 1px solid rgba(128, 128, 128, 0.25);
-        border-radius: 8px;
-        background: rgba(128, 128, 128, 0.04);
-        color: inherit;
-        font-size: 0.85rem;
-        cursor: pointer;
-        transition: all 0.15s ease;
-        text-align: center;
-    }
-    .suggestion-btn:hover {
-        background: rgba(192, 132, 252, 0.12);
-        border-color: rgba(192, 132, 252, 0.5);
-    }
-    /* ========== 处理中状态 ========== */
-    .processing-indicator {
+    .dice-container {
         display: flex;
         align-items: center;
-        gap: 0.5rem;
-        padding: 0.6rem 1rem;
-        background: rgba(192, 132, 252, 0.1);
-        border: 1px solid rgba(192, 132, 252, 0.3);
-        border-radius: 8px;
-        font-size: 0.9rem;
-        color: #c084fc;
-        animation: pulse 2s infinite;
+        gap: 16px;
+        padding: 16px 20px;
+        margin: 10px 0;
+        background: rgba(32, 27, 22, 0.9);
+        border-radius: 6px;
+        border: 1px solid rgba(217, 207, 188, 0.12);
+        animation: diceGlow 2.2s infinite;
+        --dice: #7FA05F;
     }
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.6; }
+    .dice-container.dice-fail { --dice: #C96A5E; }
+    .dice-container.dice-damage { --dice: #C96A5E; }
+    .dice-container.dice-san { --dice: #9A86B8; }
+    .dice-cube {
+        width: 64px;
+        height: 64px;
+        perspective: 200px;
+        flex-shrink: 0;
+    }
+    .dice-inner {
+        width: 64px;
+        height: 64px;
+        background: #221D17;
+        border: 2px solid var(--dice);
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 28px;
+        font-weight: bold;
+        color: var(--dice);
+        animation: diceRoll 0.8s ease-out;
+    }
+    .dice-result { animation: resultPop 0.4s ease-out 0.7s both; }
+    .dice-info {
+        flex: 1;
+        color: #D9CFBC;
+        font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+    }
+    .dice-attr { font-size: 0.85rem; color: #8A8175; margin-bottom: 4px; }
+    .dice-values { font-size: 1.1rem; font-weight: bold; }
+    .dice-values span:first-child { color: var(--dice); }
+    .dice-target { color: #8A8175; font-size: 0.9rem; }
+    .dice-outcome { font-size: 1.3rem; font-weight: bold; color: var(--dice); margin-top: 2px; }
+    /* ========== 减少动效偏好：动画全部降级为静态 ========== */
+    @media (prefers-reduced-motion: reduce) {
+        .dice-inner, .dice-container, .dice-result { animation: none !important; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -168,7 +171,7 @@ def init_session():
         try:
             st.session_state.embedding_model = create_embedding_model()
         except Exception as e:
-            st.warning(f"⚠️ Embedding 模型加载失败，RAG 功能暂不可用: {e}")
+            st.warning(f"Embedding 模型加载失败，RAG 功能暂不可用: {e}", icon=":material/warning:")
             st.session_state.embedding_model = None
 
     if "rag_collection" not in st.session_state:
@@ -212,146 +215,120 @@ def init_session():
 
 def render_sidebar():
     """
-    渲染侧边栏：角色属性面板 + 文件上传 + 重置按钮。
+    渲染侧边栏：角色面板 + 知识库上传 + 重置按钮。
+    全部使用原生组件（metric / progress / badge / expander），
+    视觉由 .streamlit/config.toml 主题统一控制。
     """
     char = st.session_state.character
 
     with st.sidebar:
         st.title("🐙 COC 守秘人")
-        st.caption(f"会话: {st.session_state.session_id[:8]}...")
+        st.caption(f"会话 {st.session_state.session_id[:8]}")
 
-        st.divider()
+        # ---- 状态徽章 + 角色名 ----
+        status = char.get("status", "alive")
+        if status == "dead":
+            st.badge("已死亡", icon=":material/skull:", color="red")
+        elif status == "insane":
+            st.badge("永久疯狂", icon=":material/cyclone:", color="violet")
+        else:
+            st.badge("调查进行中", icon=":material/mystery:", color="green")
+        st.markdown(f"### {char.get('name', '调查员')}")
 
-        # ---- 角色信息 ----
-        st.subheader(f"📋 {char.get('name', '调查员')}")
+        # ---- 六维属性：2 列角色卡 ----
+        attr_labels = {
+            "STR": "力量 STR",
+            "DEX": "敏捷 DEX",
+            "POW": "感知 POW",
+            "WILL": "意志 WILL",
+            "INT": "智力 INT",
+            "IDEA": "灵感 IDEA",
+        }
+        for row_keys in [("STR", "DEX"), ("POW", "WILL"), ("INT", "IDEA")]:
+            cols = st.columns(2, gap="small")
+            for col, key in zip(cols, row_keys):
+                col.metric(label=attr_labels[key], value=char.get(key, 0), border=True)
 
-        # 六维属性
-        st.markdown("**基础属性**")
-        attrs = [
-            ("💪 力量 STR", "STR"),
-            ("🏃 敏捷 DEX", "DEX"),
-            ("🔮 感知 POW", "POW"),
-            ("🧠 意志 WILL", "WILL"),
-            ("📚 智力 INT", "INT"),
-            ("💡 灵感 IDEA", "IDEA"),
-        ]
-        for label, key in attrs:
-            val = char.get(key, 0)
-            st.markdown(
-                f'<div class="attr-row"><span class="attr-label">{label}</span>'
-                f'<span class="attr-value">{val}</span></div>',
-                unsafe_allow_html=True,
-            )
+        st.space("small")
 
-        st.divider()
-
-        # 派生属性
-        st.markdown("**派生属性**")
+        # ---- 派生属性 ----
         max_hp = char.get("MAX_HP", 10)
         max_san = char.get("MAX_SAN", 50)
         max_sta = char.get("MAX_STA", 50)
         hp_ratio = char["HP"] / max_hp if max_hp > 0 else 0
         san_ratio = char["SAN"] / max_san if max_san > 0 else 0
 
-        # HP
-        hp_class = "attr-danger" if hp_ratio < 0.3 else ""
-        st.markdown(
-            f'<div class="attr-row"><span>❤️ HP</span>'
-            f'<span class="attr-value {hp_class}">{char["HP"]}/{max_hp}</span></div>',
-            unsafe_allow_html=True,
-        )
-        st.progress(hp_ratio)
-
-        # SAN
-        san_class = "attr-danger" if san_ratio < 0.3 else ""
-        st.markdown(
-            f'<div class="attr-row"><span>🧠 SAN</span>'
-            f'<span class="attr-value {san_class}">{char["SAN"]}/{max_san}</span></div>',
-            unsafe_allow_html=True,
-        )
-        st.progress(san_ratio)
-
-        # STA
-        st.markdown(
-            f'<div class="attr-row"><span>⚡ STA</span>'
-            f'<span class="attr-value">{char.get("STA", 0)}/{max_sta}</span></div>',
-            unsafe_allow_html=True,
-        )
-
-        # 状态标签
-        status = char.get("status", "alive")
-        if status == "dead":
-            badge = '<span class="status-badge status-dead">💀 已死亡</span>'
-        elif status == "insane":
-            badge = '<span class="status-badge status-insane">🌀 已疯狂</span>'
-        else:
-            badge = '<span class="status-badge status-alive">✅ 进行中</span>'
-        st.markdown(badge, unsafe_allow_html=True)
+        hp_text = f"HP **{char['HP']}/{max_hp}**"
+        san_text = f"SAN **{char['SAN']}/{max_san}**"
+        if hp_ratio < 0.3:
+            hp_text = f":red[HP {char['HP']}/{max_hp}]"
+        if san_ratio < 0.3:
+            san_text = f":red[SAN {char['SAN']}/{max_san}]"
+        st.progress(hp_ratio, text=hp_text)
+        st.progress(san_ratio, text=san_text)
+        st.markdown(f"STA {char.get('STA', 0)}/{max_sta}")
 
         if char.get("wounded"):
-            st.warning("⚠️ 重伤状态 —— HP 低于 30%")
+            st.warning("重伤状态：HP 低于 30%", icon=":material/medical_information:")
         if char.get("temp_insanity"):
-            st.warning("🌀 临时疯狂 —— 行为可能不受控制")
+            st.warning("临时疯狂：行为可能不受控制", icon=":material/cyclone:")
 
-        st.divider()
+        st.space("medium")
 
         # ---- 知识库：规则书上传 ----
-        st.subheader("📖 规则参考")
-        rule_files = st.file_uploader(
-            "上传规则书 / 怪物图鉴 / 法术手册（TXT / PDF）",
-            type=["txt", "pdf"],
-            key="rule_uploader",
-            accept_multiple_files=True,
-            help="规则书仅作为 KP 的参考知识，不会改变当前剧情。",
-            disabled=st.session_state.processing,
-        )
-        if rule_files:
-            _handle_rule_uploads(rule_files)
-
-        st.divider()
+        with st.expander("规则参考", icon=":material/menu_book:"):
+            rule_files = st.file_uploader(
+                "上传规则书、怪物图鉴或法术手册（TXT / PDF）",
+                type=["txt", "pdf"],
+                key="rule_uploader",
+                accept_multiple_files=True,
+                help="规则书仅作为 KP 的参考知识，不会改变当前剧情。",
+                disabled=st.session_state.processing,
+            )
+            if rule_files:
+                _handle_rule_uploads(rule_files)
 
         # ---- 知识库：剧本上传 ----
-        st.subheader("📜 剧本模组")
-        scenario_files = st.file_uploader(
-            "上传剧本模组（TXT / PDF）—— 上传后将自动生成对应开场剧情",
-            type=["txt", "pdf"],
-            key="scenario_uploader",
-            accept_multiple_files=True,
-            help="上传剧本后 KP 会根据剧本内容重新生成开场白和故事目标。",
-            disabled=st.session_state.processing,
-        )
-        if scenario_files:
-            _handle_scenario_uploads(scenario_files)
+        with st.expander("剧本模组", icon=":material/description:"):
+            scenario_files = st.file_uploader(
+                "上传剧本模组（TXT / PDF），上传后自动生成对应开场剧情",
+                type=["txt", "pdf"],
+                key="scenario_uploader",
+                accept_multiple_files=True,
+                help="上传剧本后 KP 会根据剧本内容重新生成开场白和故事目标。",
+                disabled=st.session_state.processing,
+            )
+            if scenario_files:
+                _handle_scenario_uploads(scenario_files)
 
-        # 显示索引状态
+        # 索引状态
         rule_count = len(st.session_state.get("indexed_rule_names", set()))
         scenario_count = len(st.session_state.get("indexed_scenario_names", set()))
         if rule_count > 0:
-            st.success(f"📖 已加载 {rule_count} 个规则文件")
+            st.caption(f":green[已加载 {rule_count} 个规则文件]")
         if scenario_count > 0:
-            st.success(f"📜 已加载 {scenario_count} 个剧本文件")
+            st.caption(f":green[已加载 {scenario_count} 个剧本文件]")
         if rule_count == 0 and scenario_count == 0:
             st.caption("未加载知识库（可选）")
 
-        # ---- 当前场景位置 ----
-        current_scene = st.session_state.get("current_scene", "")
+        st.space("medium")
+
+        # ---- 当前进度 ----
         turn_count = len([m for m in st.session_state.get("messages", []) if m.get("role") == "user"])
         if turn_count > 0:
-            st.divider()
-            st.markdown("📍 **当前进度**")
-            st.caption(f"回合数：{turn_count}")
+            st.caption(f"回合数 {turn_count}")
+            current_scene = st.session_state.get("current_scene", "")
             if current_scene:
-                st.caption(f"位置：{current_scene}")
+                st.caption(f"位置 {current_scene}")
 
-        st.divider()
+        st.space("small")
 
         # ---- 重置按钮 ----
-        if st.button("🔄 重置游戏", use_container_width=True, type="primary",
-                     disabled=st.session_state.processing):
+        if st.button("重置游戏", icon=":material/restart_alt:", type="primary",
+                     width="stretch", disabled=st.session_state.processing):
             _reset_game()
 
-        st.divider()
-        st.caption("Powered by LangGraph + DeepSeek")
+        st.caption("LangGraph + DeepSeek")
 
 
 def _index_files(uploaded_files: list, file_type: str) -> list:
@@ -476,26 +453,28 @@ def _reset_game():
 
 def render_main():
     """渲染主区域：对话历史 + 输入区域。"""
-    st.title("🐙 克苏鲁的呼唤 · AI 守秘人")
+    st.title("克苏鲁的呼唤")
     st.caption("你是一名调查员。黑暗中有东西在蠕动……你准备好面对真相了吗？")
 
     # ---- 处理待生成的开场白（剧本上传后触发） ----
     pending = st.session_state.pop("pending_opening_content", None)
     if pending:
-        with st.spinner("🐙 KP 正在根据剧本生成开场剧情……"):
+        with st.status("KP 正在根据剧本生成开场剧情", expanded=False) as opening_status:
             try:
                 _generate_opening_from_upload(pending, st.session_state.session_id)
+                opening_status.update(label="开场剧情已生成", state="complete")
             except Exception as e:
                 logger.warning(f"开场生成失败: {e}")
                 _fallback_opening_from_text(pending)
+                opening_status.update(label="已使用剧本原文生成开场", state="complete")
         st.rerun()
 
-    st.divider()
+    st.space("small")
 
     # ---- 对话历史 ----
     _render_chat_history()
 
-    st.divider()
+    st.space("medium")
 
     # ---- 输入区域 ----
     _render_input_area()
@@ -522,9 +501,9 @@ def _render_chat_history():
                 unsafe_allow_html=True,
             )
         if goal:
-            st.info(f"🎯 **你的目标：{goal}**")
+            st.info(f"你的目标：{goal}", icon=":material/track_changes:")
 
-        st.caption("——你打算怎么做？")
+        st.caption("你打算怎么做？")
         return
 
     for msg in messages:
@@ -621,7 +600,7 @@ def _fallback_opening_from_text(content: str):
 
     text = "".join(narrative_lines)[:400] if narrative_lines else raw[:400]
     st.session_state.opening_narrative = (
-        f"夜色笼罩着阿卡姆，一场新的冒险即将开始——\n\n"
+        f"夜色笼罩着阿卡姆，一场新的冒险即将开始。\n\n"
         f"<em>{text}……</em>"
     )
     st.session_state.story_goal = "根据上传的剧本/规则书自由探索"
@@ -635,28 +614,20 @@ def _render_input_area():
         hp = st.session_state.character.get("HP", 0)
         san = st.session_state.character.get("SAN", 0)
         if hp <= 0:
-            st.error("💀 **游戏结束 —— 调查员已死亡。** 点击侧边栏「🔄 重置游戏」开始新的冒险。")
+            st.error("调查员已死亡。点击侧边栏「重置游戏」开始新的冒险。", icon=":material/skull:")
         elif san <= 0:
-            st.error("🌀 **游戏结束 —— 调查员陷入永久疯狂。** 点击侧边栏「🔄 重置游戏」开始新的冒险。")
+            st.error("调查员陷入永久疯狂。点击侧边栏「重置游戏」开始新的冒险。", icon=":material/cyclone:")
         else:
-            st.warning("📖 **故事落幕。** 点击侧边栏「🔄 重置游戏」开启一段新的故事。")
+            st.warning("故事落幕。点击侧边栏「重置游戏」开启一段新的故事。", icon=":material/auto_stories:")
         return
 
-    # 处理中状态：显示进度指示 + 强制跳过按钮
+    # 处理中状态：原生 st.status + 超时跳过按钮
     if st.session_state.processing:
         elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
-        st.markdown(
-            f'<div class="processing-indicator">'
-            f'🐙 <strong>KP 正在编织命运……</strong>'
-            f'<span style="margin-left:auto;opacity:0.7">已等待 {elapsed}s</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        # 超过 15 秒后显示跳过按钮
-        if elapsed >= 15:
-            col_a, col_b = st.columns([1, 3])
-            with col_a:
-                if st.button("⏭ 跳过等待", key=f"skip_{elapsed}", use_container_width=True,
+        with st.status(f"KP 正在编织命运（已等待 {elapsed}s）", state="running"):
+            # 超过 15 秒后显示跳过按钮
+            if elapsed >= 15:
+                if st.button("跳过等待", key=f"skip_{elapsed}", icon=":material/skip_next:",
                              help="中断当前请求，KP 会使用降级回复"):
                     st.session_state.processing = False
                     st.session_state.pop("_processing_start", None)
@@ -664,31 +635,29 @@ def _render_input_area():
                     msgs = list(st.session_state.messages)
                     msgs.append({
                         "role": "system",
-                        "content": "⏭ KP 响应超时，已被跳过。",
+                        "content": "KP 响应超时，已被跳过。",
                     })
                     msgs.append({
                         "role": "assistant",
-                        "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待——它不急。你决定继续前行。",
+                        "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待，它不急。你决定继续前行。",
                     })
                     st.session_state.messages = msgs
                     st.session_state.current_suggestions = [
                         "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
                     ]
                     st.rerun()
-            with col_b:
-                st.caption("KP 正在生成回复，请耐心等待……若超过 30 秒建议跳过")
-        # 渲染建议
+                st.caption("KP 正在生成回复，请耐心等待，若超过 30 秒建议跳过")
+        # 渲染建议（处理中禁用）
         suggestions = st.session_state.get("current_suggestions", [])
         if suggestions:
-            st.caption("💡 **你可以这样做：**")
             cols = st.columns(len(suggestions))
             for i, (col, sug) in enumerate(zip(cols, suggestions)):
-                col.button(sug, key=f"sug_disabled_{i}", disabled=True, use_container_width=True)
+                col.button(sug, key=f"sug_disabled_{i}", disabled=True, width="stretch")
         return
 
     # 正常输入
     player_input = st.chat_input(
-        placeholder="描述你的行动……（例如：我小心翼翼地推开图书馆的门）",
+        placeholder="描述你的行动，例如：我小心翼翼地推开图书馆的门",
         disabled=st.session_state.processing,
     )
 
@@ -698,11 +667,10 @@ def _render_input_area():
     # 渲染行动建议按钮（非处理中状态）
     suggestions = st.session_state.get("current_suggestions", [])
     if suggestions:
-        st.caption("💡 **你可以这样做：**")
         cols = st.columns(len(suggestions))
         for i, (col, sug) in enumerate(zip(cols, suggestions)):
             btn_key = f"sug_{hash(sug)}_{st.session_state.session_id[:6]}_{i}"
-            if col.button(sug, key=btn_key, use_container_width=True):
+            if col.button(sug, key=btn_key, width="stretch"):
                 _process_player_input(sug)
 
 
@@ -779,26 +747,29 @@ def _process_player_input(player_input: str):
             hp = st.session_state.character.get("HP", 0)
             san = st.session_state.character.get("SAN", 0)
             if hp <= 0:
-                st.toast("💀 调查员已死亡", icon="💀")
+                st.toast("调查员已死亡", icon=":material/skull:")
                 st.error(
-                    "## 💀 游戏结束 —— 调查员已死亡\n\n"
+                    "## 调查员已死亡\n\n"
                     "世界将永远不知道这里发生了什么……\n\n"
-                    "点击侧边栏「🔄 重置游戏」开始新的冒险。"
+                    "点击侧边栏「重置游戏」开始新的冒险。",
+                    icon=":material/skull:",
                 )
             elif san <= 0:
-                st.toast("🌀 调查员陷入永久疯狂", icon="🌀")
+                st.toast("调查员陷入永久疯狂", icon=":material/cyclone:")
                 st.error(
-                    "## 🌀 游戏结束 —— 调查员陷入永久疯狂\n\n"
+                    "## 调查员陷入永久疯狂\n\n"
                     "理智的最后一根弦，已经断了。\n\n"
-                    "点击侧边栏「🔄 重置游戏」开始新的冒险。"
+                    "点击侧边栏「重置游戏」开始新的冒险。",
+                    icon=":material/cyclone:",
                 )
             else:
-                st.toast("📖 故事落幕", icon="📖")
+                st.toast("故事落幕", icon=":material/auto_stories:")
                 st.warning(
-                    "## 📖 故事落幕\n\n"
+                    "## 故事落幕\n\n"
                     "这段冒险就此画上句号。无论结局是平静还是遗憾，"
                     "那些无法言说的秘密将永远封存在记忆深处……\n\n"
-                    "点击侧边栏「🔄 重置游戏」开启一段新的故事。"
+                    "点击侧边栏「重置游戏」开启一段新的故事。",
+                    icon=":material/auto_stories:",
                 )
 
     finally:
@@ -809,136 +780,127 @@ def _process_player_input(player_input: str):
 
 def _show_dice_animation(state: dict):
     """
-    有检定时展示骰子动画（CSS 3D 骰子滚动效果）。
-    从最近一条 system 消息中提取检定结果。
+    有事件发生时展示骰子动画面板（CSS 3D 骰子滚动效果）。
+    从最近一条 system 消息中识别事件类型：
+        - 属性检定（成功绿 / 失败红）
+        - 受到伤害（血红）
+        - 理智损失（灰紫）
+    一轮可能同时发生多个事件，逐类渲染。
+    样式定义在页面顶部的全局 CSS 中，此处用 st.html 内联渲染结构。
     """
     messages = state.get("messages", [])
-    # 查找最近一条 system 消息（检定结果）
-    check_result = ""
+    # 查找最近一条 system 消息（render_node 合并后的本轮结果）
+    system_msg = ""
     for msg in reversed(messages):
         if msg.get("role") == "system":
-            check_result = msg.get("content", "")
+            system_msg = msg.get("content", "")
             break
 
-    if not check_result or "检定" not in check_result:
+    if not system_msg:
         return
 
-    # 判断成败
-    is_success = any(w in check_result for w in ["成功", "通过", "大成功"])
-    is_failure = any(w in check_result for w in ["失败", "未通过", "大失败"])
-    is_critical = "大成功" in check_result or "大失败" in check_result
-
-    result_emoji = "🎉" if is_success else "💥"
-    result_text = "成功" if is_success else ("大失败…" if "大失败" in check_result else "失败")
-    result_color = "#4ade80" if is_success else "#ef4444"
-
-    # 提取检定类型和骰值
     import re
-    attr_match = re.search(r'(\S+)检定', check_result)
-    attr_name = attr_match.group(1) if attr_match else "检定"
-    dice_match = re.search(r'(\d{1,3})\s*/\s*(\d{1,3})', check_result)
-    dice_roll = dice_match.group(1) if dice_match else "?"
-    dice_target = dice_match.group(2) if dice_match else "?"
+    panels = []
 
-    dice_html = f"""
-    <style>
-        @keyframes diceRoll {{
-            0% {{ transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg); }}
-            25% {{ transform: rotateX(180deg) rotateY(90deg) rotateZ(45deg); }}
-            50% {{ transform: rotateX(360deg) rotateY(180deg) rotateZ(90deg); }}
-            75% {{ transform: rotateX(540deg) rotateY(270deg) rotateZ(135deg); }}
-            100% {{ transform: rotateX(720deg) rotateY(360deg) rotateZ(0deg); }}
-        }}
-        @keyframes resultPop {{
-            0% {{ transform: scale(0.3); opacity: 0; }}
-            60% {{ transform: scale(1.15); opacity: 1; }}
-            100% {{ transform: scale(1); opacity: 1; }}
-        }}
-        @keyframes pulse {{
-            0%, 100% {{ box-shadow: 0 0 8px VAR_SHADOW; }}
-            50% {{ box-shadow: 0 0 24px VAR_SHADOW, 0 0 48px VAR_SHADOW; }}
-        }}
-        .dice-container {{
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            padding: 16px 20px;
-            margin: 10px 0;
-            background: rgba(30, 30, 45, 0.85);
-            border-radius: 16px;
-            border: 1px solid rgba(255,255,255,0.1);
-            animation: pulse 2s infinite;
-            --shadow: {result_color};
-        }}
-        .dice-cube {{
-            width: 64px;
-            height: 64px;
-            perspective: 200px;
-            flex-shrink: 0;
-        }}
-        .dice-inner {{
-            width: 64px;
-            height: 64px;
-            background: linear-gradient(135deg, #1a1a2e, #2d2d44);
-            border: 3px solid {result_color};
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 28px;
-            font-weight: bold;
-            color: {result_color};
-            animation: diceRoll 0.8s ease-out;
-        }}
-        .dice-result {{
-            animation: resultPop 0.4s ease-out 0.7s both;
-        }}
-        .dice-info {{
-            flex: 1;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-        }}
-        .dice-attr {{
-            font-size: 0.85rem;
-            color: #9ca3af;
-            margin-bottom: 4px;
-        }}
-        .dice-values {{
-            font-size: 1.1rem;
-            font-weight: bold;
-        }}
-        .dice-target {{ color: #9ca3af; font-size: 0.9rem; }}
-        .dice-outcome {{
-            font-size: 1.3rem;
-            font-weight: bold;
-            color: {result_color};
-            margin-top: 2px;
-        }}
-    </style>
-    <div class="dice-container">
+    # ---- 1. 属性检定面板 ----
+    check_match = re.search(r'【(\S+?)检定', system_msg)
+    if check_match:
+        attr_name = check_match.group(1)
+        roll_match = re.search(r'掷出[:：]\s*(\d{1,3})', system_msg)
+        target_match = re.search(r'属性值[:：]\s*(\d{1,3})', system_msg)
+        dice_roll = roll_match.group(1) if roll_match else "?"
+        dice_target = target_match.group(1) if target_match else "?"
+
+        is_success = any(w in system_msg for w in ["成功", "通过", "大成功"])
+        result_emoji = "🎉" if is_success else "💥"
+        result_text = "成功" if is_success else ("大失败…" if "大失败" in system_msg else "失败")
+        fail_class = "" if is_success else " dice-fail"
+
+        panels.append(f"""
+    <div class="dice-container{fail_class}">
         <div class="dice-cube">
             <div class="dice-inner">{result_emoji}</div>
         </div>
         <div class="dice-info dice-result">
             <div class="dice-attr">🎲 {attr_name}检定</div>
             <div class="dice-values">
-                <span style="color:{result_color}">{dice_roll}</span>
-                <span class="dice-target"> / {dice_target}</span>
+                <span>{dice_roll}</span>
+                <span class="dice-target"> / 目标 {dice_target}</span>
             </div>
             <div class="dice-outcome">{result_text}</div>
         </div>
-    </div>
-    """
+    </div>""")
 
-    # 使用 components.html 渲染（临时容器，渲染后自动消失）
-    import streamlit.components.v1 as components
-    components.html(dice_html, height=130)
+    # ---- 2. 受到伤害面板 ----
+    dmg_match = re.search(r'损失\s*(\d+)\s*点\s*HP', system_msg)
+    if dmg_match:
+        damage = dmg_match.group(1)
+        hp_match = re.search(r'（(\d+)\s*→\s*(\d+)\s*/\s*(\d+)）', system_msg)
+        hp_old, hp_new, hp_max = hp_match.groups() if hp_match else ("?", "?", "?")
+        hp_line = f"{hp_old} → {hp_new}/{hp_max}" if hp_match else ""
+        outcome = f"生命值 {hp_new}/{hp_max}" if hp_match else "受伤"
+        panels.append(f"""
+    <div class="dice-container dice-damage">
+        <div class="dice-cube">
+            <div class="dice-inner">⚔️</div>
+        </div>
+        <div class="dice-info dice-result">
+            <div class="dice-attr">⚔️ 受到伤害</div>
+            <div class="dice-values">
+                <span>{damage}</span>
+                <span class="dice-target"> 点 HP {hp_line}</span>
+            </div>
+            <div class="dice-outcome">{outcome}</div>
+        </div>
+    </div>""")
+
+    # ---- 3. 理智损失面板 ----
+    san_match = re.search(r'丧失\s*(\d+)\s*点\s*SAN', system_msg)
+    if san_match:
+        san_loss = san_match.group(1)
+        cur_match = re.search(r'当前\s*SAN[:：]\s*(\d+)', system_msg)
+        san_now = cur_match.group(1) if cur_match else "?"
+        panels.append(f"""
+    <div class="dice-container dice-san">
+        <div class="dice-cube">
+            <div class="dice-inner">🧠</div>
+        </div>
+        <div class="dice-info dice-result">
+            <div class="dice-attr">🧠 理智损失</div>
+            <div class="dice-values">
+                <span>{san_loss}</span>
+                <span class="dice-target"> 点 SAN</span>
+            </div>
+            <div class="dice-outcome">当前 {san_now}</div>
+        </div>
+    </div>""")
+
+    if not panels:
+        return
+
+    st.html("\n".join(panels))
+
+
+def _typewriter(placeholder, css_class: str, text: str, prefix: str = "",
+                chunk_size: int = 8, delay: float = 0.02):
+    """
+    分块打字机效果：每次追加 chunk_size 个字符重绘一次。
+    比逐字符渲染更省 Streamlit 往返，同时保留逐字浮现的叙述感。
+    """
+    displayed = ""
+    for i in range(0, len(text), chunk_size):
+        displayed += text[i:i + chunk_size]
+        placeholder.markdown(
+            f'<div class="chat-message {css_class}">{prefix}{displayed}</div>',
+            unsafe_allow_html=True,
+        )
+        time.sleep(delay)
 
 
 def _stream_render(state: dict):
     """
     流式展示本轮新增的输出（不重复渲染历史消息）。
-    使用更快的字符间隔以减少等待感。
+    先游戏层面回应（等宽），再 KP 环境叙述（衬线）。
     """
     messages = state.get("messages", [])
 
@@ -960,33 +922,16 @@ def _stream_render(state: dict):
         if system_msg and render_msg:
             break
 
-    # 先输出游戏层面回应（较快速度）
+    # 先输出游戏层面回应（等宽字体，较快速度）
     if system_msg:
         with st.chat_message("assistant", avatar="🎲"):
-            placeholder = st.empty()
-            displayed = ""
-            delay = 0.003 if len(system_msg) > 100 else 0.005  # 长文本快一点
-            for char in system_msg:
-                displayed += char
-                placeholder.markdown(
-                    f'<div class="chat-message chat-system">{displayed}</div>',
-                    unsafe_allow_html=True,
-                )
-                time.sleep(delay)
+            _typewriter(st.empty(), "chat-system", system_msg, chunk_size=12)
 
-    # 再输出 KP 环境叙述
+    # 再输出 KP 环境叙述（衬线字体）
     if render_msg:
         with st.chat_message("assistant", avatar="🐙"):
-            placeholder = st.empty()
-            displayed = ""
-            delay = 0.004 if len(render_msg) > 150 else 0.006
-            for char in render_msg:
-                displayed += char
-                placeholder.markdown(
-                    f'<div class="chat-message chat-keeper">{displayed}</div>',
-                    unsafe_allow_html=True,
-                )
-                time.sleep(delay)
+            _typewriter(st.empty(), "chat-keeper", render_msg,
+                        prefix="<strong>🐙 KP：</strong><br>")
 
 
 # ===================== 主入口 =====================

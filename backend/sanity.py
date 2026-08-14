@@ -25,27 +25,25 @@ def reduce_sanity(current_san: int, loss: int, max_san: int) -> Dict[str, Any]:
             "new_san": int,           # 新理智值
             "loss": int,              # 实际损失
             "is_indefinite_insane": bool,  # 永久疯狂（SAN ≤ 0）
-            "is_temporary_insane": bool,   # 临时疯狂（单次损失 ≥ 5）
-            "description": str,            # 描述文本
+            "is_temporary_insane": bool,   # 是否触发临时疯狂判定（单次损失 ≥ 5）
+            "temp_duration": int,          # 临时疯狂持续回合数（未触发时为 0）
+            "description": str,            # 描述文本（不含智力检定结果，由调用方掷骰追加）
         }
     """
     actual_loss = min(loss, current_san)  # 不会扣到负数
     new_san = max(0, current_san - actual_loss)
 
+    # COC 7e：单次损失 ≥ 5 时触发智力检定，成功才陷入临时疯狂（由 tools 执行掷骰）
     is_temporary_insane = actual_loss >= 5 and current_san > 0
     is_indefinite_insane = new_san <= 0
+    temp_duration = random.randint(1, 10) if is_temporary_insane else 0
 
     if is_indefinite_insane:
         desc = f"💀 理智彻底崩溃！丧失 {actual_loss} 点 SAN（当前 SAN: {new_san}）。调查员陷入永久疯狂，无法继续冒险。"
     elif is_temporary_insane:
-        temp_duration = random.randint(1, 10)
-        desc = (
-            f"😱 剧烈的精神冲击！丧失 {actual_loss} 点 SAN（当前 SAN: {new_san}/{max_san}）。\n"
-            f"进行一次智力检定（D100 ≤ INT）以判断是否意识到恐怖真相……\n"
-            f"若智力检定成功，将触发临时疯狂（持续 {temp_duration} 回合/小时）。"
-        )
+        desc = f"😱 剧烈的精神冲击！丧失 {actual_loss} 点 SAN（当前 SAN: {new_san}/{max_san}）。"
     elif actual_loss > 0:
-        desc = f"😨 感到不安——丧失 {actual_loss} 点 SAN（当前 SAN: {new_san}/{max_san}）。"
+        desc = f"😨 感到不安，丧失 {actual_loss} 点 SAN（当前 SAN: {new_san}/{max_san}）。"
     else:
         desc = "😐 内心毫无波澜，未受到影响。"
 
@@ -54,6 +52,7 @@ def reduce_sanity(current_san: int, loss: int, max_san: int) -> Dict[str, Any]:
         "loss": actual_loss,
         "is_indefinite_insane": is_indefinite_insane,
         "is_temporary_insane": is_temporary_insane,
+        "temp_duration": temp_duration,
         "description": desc,
     }
 

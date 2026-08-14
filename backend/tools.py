@@ -119,12 +119,31 @@ def _tool_sanity_loss(params: Dict[str, Any], character: Dict[str, Any]) -> Dict
 
     result = reduce_sanity(character["SAN"], loss, character.get("MAX_SAN", character["SAN"]))
 
+    # COC 7e：单次损失 ≥ 5 时执行智力检定（D100 ≤ INT），成功才陷入临时疯狂
+    # （已永久疯狂时不再做临时疯狂判定）
+    desc = result["description"]
+    temp_insanity = False
+    if result["is_temporary_insane"] and not result["is_indefinite_insane"]:
+        int_roll = roll_d100()
+        int_value = character.get("INT", 50)
+        if int_roll <= int_value:
+            temp_insanity = True
+            desc += (
+                f"\n🎲 智力检定：掷出 {int_roll} ≤ INT {int_value}，检定成功。"
+                f"你理解了眼前的一切，陷入临时疯狂（持续 {result['temp_duration']} 回合/小时）！"
+            )
+        else:
+            desc += (
+                f"\n🎲 智力检定：掷出 {int_roll} > INT {int_value}，检定失败。"
+                f"你的大脑选择遗忘，暂时压抑了这份恐怖。"
+            )
+
     updated = update_character(character, {
         "SAN": result["new_san"],
-        "temp_insanity": result["is_temporary_insane"],
+        "temp_insanity": temp_insanity,
     })
 
-    message = f"🧠 【理智损失 · {reason}】\n{result['description']}"
+    message = f"🧠 【理智损失 · {reason}】\n{desc}"
 
     return {
         "success": True,
@@ -160,7 +179,7 @@ def _tool_combat_damage(params: Dict[str, Any], character: Dict[str, Any]) -> Di
            f"损失 {damage} 点 HP（{character['HP']} → {new_hp}/{character.get('MAX_HP', '?')}）"
 
     if new_hp <= 0:
-        desc += "\n\n💀 生命值归零——调查员已死亡！"
+        desc += "\n\n💀 生命值归零，调查员已死亡！"
 
     return {
         "success": True,

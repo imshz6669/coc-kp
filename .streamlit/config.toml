@@ -1,0 +1,51 @@
+# ============================================================
+# COC 守秘人 · 主题配置
+# 视觉语言：「烛光密室 · 古旧手稿」暗色恐怖叙事
+#  - 暖墨黑背景 + 骨白正文 + 唯一强调色烛光琥珀
+#  - 标题与 KP 叙述用衬线（1920s pulp 手稿遗产），玩家消息无衬线，骰子数字等宽
+#  - 全局圆角 4px（书页锐角感），徽章胶囊
+#  - 单主题锁定（暗色）：恐怖跑团的场景基调，不分段跳变
+# ============================================================
+
+[theme]
+base = "dark"
+
+# ---- 基调色 ----
+# 强调色烛光琥珀：#9C6B26 与白色按钮文字对比约 4.6:1，通过 WCAG AA
+primaryColor = "#9C6B26"
+backgroundColor = "#151210"
+secondaryBackgroundColor = "#201B16"
+textColor = "#D9CFBC"
+linkColor = "#C89B5A"
+codeTextColor = "#D9CFBC"
+codeBackgroundColor = "#201B16"
+borderColor = "#40382D"
+
+# ---- 语义色（仅用于状态表达，非装饰）----
+redColor = "#C96A5E"      # 血锈红：失败 / 死亡 / 危险值
+orangeColor = "#C89B5A"   # 烛光橙：次级提示
+yellowColor = "#D9C46A"   # 旧金：警示
+greenColor = "#7FA05F"    # 苔绿：成功 / 存活
+blueColor = "#7D99AE"     # 雾蓝：信息框
+violetColor = "#9A86B8"   # 灰紫：疯狂状态（仅语义用）
+grayColor = "#8A8175"     # 尘埃灰：辅助文字
+
+# ---- 字体三声部 ----
+# 标题 + KP 叙述：衬线（旧书口吻）；正文/玩家：无衬线（现代之口）；代码/骰子：等宽
+# Google Fonts 不可达时自动回退系统字体（Windows: SimSun / Microsoft YaHei / Consolas）
+font = "'Noto Sans SC':https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap"
+headingFont = "'Noto Serif SC':https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap"
+codeFont = "'JetBrains Mono', Consolas, 'Courier New', monospace"
+
+# ---- 形状与边框 ----
+baseRadius = "small"          # 4px，全局统一锐角书页感
+buttonRadius = "small"
+showWidgetBorder = true       # 细线边框，版画感
+showSidebarBorder = true
+
+# ---- 侧边栏（角色卡面板，比主区略深一层）----
+[theme.sidebar]
+backgroundColor = "#191511"
+secondaryBackgroundColor = "#221D17"
+textColor = "#D9CFBC"
+borderColor = "#40382D"

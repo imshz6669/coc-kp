@@ -67,9 +67,13 @@ KP_SYSTEM_PROMPT = """
 - `scene`：**必填字段**。当前玩家所处的具体场景/位置名称，4-8字，用于侧边栏进度追踪。必须是明确的地名或房间名，绝不能是叙事文本片段。例如："乌蘅镇茶馆""沈宅前院枯井""地下密室""禁地深潭""温斯洛普大厅""亨利书房""地下洞穴"。每轮必须输出，场景未变化则保持与上一轮相同。
 - `need_check`：需要检定的属性名，或 "None"。
 - `difficulty`：检定难度（"普通"/"困难"/"极难"）。
+- `hp_damage`：整数。玩家在本轮行动中实际受到的伤害点数。战斗中被击中（按武器类型 1-8）、坠落/陷阱（1-6）、灼烧等。玩家检定成功规避危险、或本轮无危险事件时为 0。
+- `san_loss`：整数。玩家在本轮目睹/经历的恐怖造成的理智损失。参考：看到尸体 0-3（轻微）、目睹怪物 1-6（中度）、遭遇神话存在 1-10（严重）、直面宇宙真相 1-100（神话）。普通紧张场景为 0。
+- `damage_source`：伤害来源简述（如"邪教徒的匕首"，hp_damage=0 时为空字符串）。
+- `san_reason`：理智损失原因简述（如"目睹仪式中的无面尸体"，san_loss=0 时为空字符串）。
 - `story_end`：布尔值。在以下两种情况设为 true：
   1. **玩家主动收束**：玩家明确表达"放弃""结束""离开""回归正常生活"等意图时。玩家第二次表达同样意图时必须结束。
-  2. **剧本自然结局**：当玩家完成了剧本的最终目标——封印完成、仪式结束、核心真相揭露、最终战斗分出胜负——故事已到达不可逆转的终点时，必须设为 true。此时 narrative 应作为故事的尾声/后日谈。
+  2. **剧本自然结局**：当玩家完成了剧本的最终目标（封印完成、仪式结束、核心真相揭露、最终战斗分出胜负），故事已到达不可逆转的终点时，必须设为 true。此时 narrative 应作为故事的尾声/后日谈。
   日常探索和推进行动设为 false。
 - `suggestions`：字符串数组，包含 3 个具体的行动建议。每个建议 6-12 字，必须是玩家在当前场景下最可能采取的合理行动。用第二人称"你"开头或不带主语均可。例如：`["仔细检查桌上的文件", "向酒保打听失踪者的消息", "沿着血迹追踪到地下室"]`。若 story_end=true，此项可为空数组。
 
@@ -80,6 +84,10 @@ KP_SYSTEM_PROMPT = """
   "scene": "当前场景简短名称",
   "need_check": "力量/敏捷/感知/智力/灵感/意志/None",
   "difficulty": "普通/困难/极难",
+  "hp_damage": 0,
+  "san_loss": 0,
+  "damage_source": "伤害来源简述（hp_damage=0 时为空字符串）",
+  "san_reason": "理智损失原因简述（san_loss=0 时为空字符串）",
   "story_end": false,
   "suggestions": ["建议1", "建议2", "建议3"]
 }
@@ -89,6 +97,12 @@ KP_SYSTEM_PROMPT = """
 - 玩家行动有失败风险且结果不确定时，选择最相关的属性检定。
 - 战斗/运动 → 力量或敏捷；阅读古籍/分析线索 → 智力；察觉异常/搜索 → 感知；抵抗恐惧/精神压迫 → 意志。
 - 闲聊、询问 NPC、无风险的观察 → need_check 设为 "None"。
+
+## 六、伤害与理智裁决指南
+- **先裁决检定，再定伤害**：玩家检定成功且规避了危险 → hp_damage 为 0；检定失败或被直接攻击 → 按武器/危险程度给出 1-8 点伤害。
+- **理智损失独立于属性检定**：玩家目睹恐怖（尸体、怪物、仪式、超自然现象）时，无论是否触发属性检定，都必须给出 san_loss。这是 COC 的核心机制，不要漏。
+- 每轮 hp_damage 与 san_loss 至少一个为 0 时，另一个也必须填写（可为 0）；两者都无 → 均填 0。
+- 不要恶意撕卡：普通小伤 1-4，重创 5-8；SAN 单次损失超过 10 只用于直面神话存在。
 """
 
 RENDER_SYSTEM_PROMPT = """
@@ -223,14 +237,14 @@ def call_kp(
     # 注入场景设定（最高优先级，放在最前面确保 KP 知道当前场景）
     if scene_context:
         system_content += (
-            f"\n\n【🎬 当前场景设定 —— 你正处在以下场景中，请以此为基础推进剧情】\n"
+            f"\n\n【🎬 当前场景设定：你正处在以下场景中，请以此为基础推进剧情】\n"
             f"{scene_context}"
         )
 
     # 注入历史记忆（在规则参考之前，位置更靠前表示重要性）
     if memory_summary:
         system_content += (
-            f"\n\n【📜 历史剧情摘要 —— 请牢记以下已发生的事件，保持叙述连贯性】\n"
+            f"\n\n【📜 历史剧情摘要：请牢记以下已发生的事件，保持叙述连贯性】\n"
             f"{memory_summary}"
         )
 
@@ -294,6 +308,10 @@ def call_kp(
         "scene": "",
         "need_check": "None",
         "difficulty": "普通",
+        "hp_damage": 0,
+        "san_loss": 0,
+        "damage_source": "",
+        "san_reason": "",
         "story_end": False,
         "suggestions": ["仔细观察周围环境", "检查随身携带的物品", "沿着来时的路退回去"],
     }
@@ -489,6 +507,11 @@ def _extract_from_narrative(text: str) -> Dict[str, str]:
         "scene": scene,
         "need_check": need_check,
         "difficulty": difficulty,
+        # 降级路径无法可靠推断数值，保守填 0（宁可不扣也不乱扣）
+        "hp_damage": 0,
+        "san_loss": 0,
+        "damage_source": "",
+        "san_reason": "",
         "story_end": story_end,
         "suggestions": suggestions,
     }
@@ -555,6 +578,22 @@ def _validate_kp_output(data: Dict) -> Dict[str, str] | None:
         "scene": str(data.get("scene", "")),
         "need_check": str(data["need_check"]),
         "difficulty": str(data["difficulty"]),
+        "hp_damage": _safe_int(data.get("hp_damage"), hi=30),
+        "san_loss": _safe_int(data.get("san_loss"), hi=100),
+        "damage_source": str(data.get("damage_source", "") or ""),
+        "san_reason": str(data.get("san_reason", "") or ""),
         "story_end": bool(data["story_end"]),
         "suggestions": suggestions,
     }
+
+
+def _safe_int(value: Any, default: int = 0, hi: int = 999) -> int:
+    """
+    安全转换为非负整数：非法值返回 default，并钳制在 [0, hi]。
+    KP 偶尔会输出字符串数字（如 "3"），需容错。
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(n, hi))

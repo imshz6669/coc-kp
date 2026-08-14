@@ -51,7 +51,9 @@ class KeeperState(TypedDict):
     messages       : 最近 N 轮对话历史（每条含 role + content）
     character      : 完整角色字典
     game_over      : 是否游戏结束
-    pending_check  : 待执行的检定信息 {"need_check": str, "difficulty": str}
+    pending_check  : 待执行的检定信息 {"need_check": str, "difficulty": str,
+                                        "hp_damage": int, "san_loss": int,
+                                        "damage_source": str, "san_reason": str}
     rag_context    : 当前轮次检索到的知识库上下文
     temp_status    : 临时状态摘要（is_wounded, is_temp_insane, etc.）
     rendered_text  : 最终润色文本
@@ -63,7 +65,7 @@ class KeeperState(TypedDict):
     messages: List[Dict[str, str]]
     character: Dict[str, Any]
     game_over: bool
-    pending_check: Dict[str, str]
+    pending_check: Dict[str, Any]
     rag_context: str
     temp_status: Dict[str, Any]
     rendered_text: str
@@ -115,7 +117,7 @@ def kp_node(state: KeeperState) -> KeeperState:
     if is_first_round and scene_context:
         effective_input = (
             f"【场景背景】\n{scene_context}\n\n"
-            f"【玩家行动 —— 请针对此行动做出回应，不要重复开场白】\n{player_input}"
+            f"【玩家行动：请针对此行动做出回应，不要重复开场白】\n{player_input}"
         )
 
     # 调用 KP
@@ -128,16 +130,22 @@ def kp_node(state: KeeperState) -> KeeperState:
         scene_context="" if is_first_round else scene_context,  # 首轮已合并到 input 中
     )
 
-    logger.info(f"KP 结果: need_check={kp_result['need_check']}, difficulty={kp_result['difficulty']}")
+    logger.info(f"KP 结果: need_check={kp_result['need_check']}, difficulty={kp_result['difficulty']}, "
+                f"hp_damage={kp_result.get('hp_damage', 0)}, san_loss={kp_result.get('san_loss', 0)}")
 
     need_check = kp_result.get("need_check", "None")
     kp_response = kp_result.get("kp_response", "")
     narrative = kp_result.get("narrative", "")
 
+    # 本轮工具执行条件：属性检定 / 受到伤害 / 理智损失，任一触发则进入 tool_node
+    hp_damage = max(0, int(kp_result.get("hp_damage", 0) or 0))
+    san_loss = max(0, int(kp_result.get("san_loss", 0) or 0))
+    needs_tools = (need_check and need_check != "None") or hp_damage > 0 or san_loss > 0
+
     # 将 KP 输出存入消息列表
     new_messages = list(messages)
-    if need_check and need_check != "None":
-        # 需要检定：用特殊标记暂存 kp_response 和 narrative，render_node 后续融合检定结果
+    if needs_tools:
+        # 需要工具执行：用特殊标记暂存 kp_response 和 narrative，render_node 后续融合结果
         new_messages.append({
             "role": "assistant",
             "content": f"[KP回应] {kp_response}",
@@ -147,7 +155,7 @@ def kp_node(state: KeeperState) -> KeeperState:
             "content": f"[KP梗概] {narrative}",
         })
     else:
-        # 无需检定：两层直接展示 —— 先游戏层面回应，再环境渲染
+        # 无需工具：两层直接展示 —— 先游戏层面回应，再环境渲染
         if kp_response:
             new_messages.append({
                 "role": "system",
@@ -173,7 +181,11 @@ def kp_node(state: KeeperState) -> KeeperState:
         "messages": new_messages,
         "pending_check": {
             "need_check": need_check,
-            "difficulty": kp_result["difficulty"],
+            "difficulty": kp_result.get("difficulty", "普通"),
+            "hp_damage": hp_damage,
+            "san_loss": san_loss,
+            "damage_source": str(kp_result.get("damage_source", "") or ""),
+            "san_reason": str(kp_result.get("san_reason", "") or ""),
         },
         "game_over": state.get("game_over", False) or story_end,
         "suggestions": suggestions,
@@ -185,12 +197,13 @@ def kp_node(state: KeeperState) -> KeeperState:
 
 def tool_node(state: KeeperState) -> KeeperState:
     """
-    工具节点 —— 执行属性检定 / 理智损失 / 战斗伤害。
+    工具节点 —— 执行属性检定 / 战斗伤害 / 理智损失。
 
     职责：
-        1. 根据 pending_check 调用 tools.execute_tool()
+        1. 根据 pending_check 链式调用 tools.execute_tool()
+           （检定 → 伤害 → 理智，依次作用于更新后的角色）
         2. 更新角色状态
-        3. 将检定结果写入消息列表
+        3. 将每条工具结果写入消息列表
     """
     logger.info("=== Tool Node Start ===")
 
@@ -200,24 +213,57 @@ def tool_node(state: KeeperState) -> KeeperState:
 
     need_check = pending.get("need_check", "None")
     difficulty = pending.get("difficulty", "普通")
+    hp_damage = max(0, int(pending.get("hp_damage", 0) or 0))
+    san_loss = max(0, int(pending.get("san_loss", 0) or 0))
 
-    # 调用统一工具入口
-    tool_result = execute_tool(
-        action="attribute_check",
-        params={"need_check": need_check, "difficulty": difficulty},
-        character=character,
-    )
+    updated_character = character
+    tool_messages = []
 
-    updated_character = tool_result.get("updated_character", character)
-    tool_message = tool_result.get("message", "")
+    # 1. 属性检定（仅当 KP 要求检定）
+    if need_check and need_check != "None":
+        result = execute_tool(
+            action="attribute_check",
+            params={"need_check": need_check, "difficulty": difficulty},
+            character=updated_character,
+        )
+        updated_character = result.get("updated_character", updated_character)
+        tool_messages.append(result.get("message", ""))
+        logger.info(f"属性检定: success={result['success']}, rolled={result.get('rolled_value')}")
 
-    logger.info(f"工具结果: success={tool_result['success']}, rolled={tool_result.get('rolled_value')}")
+    # 2. 战斗伤害（仅当本轮实际受伤）
+    if hp_damage > 0:
+        result = execute_tool(
+            action="combat_damage",
+            params={
+                "damage": hp_damage,
+                "source": pending.get("damage_source") or "不明伤害",
+            },
+            character=updated_character,
+        )
+        updated_character = result.get("updated_character", updated_character)
+        tool_messages.append(result.get("message", ""))
+        logger.info(f"战斗伤害: {hp_damage} 点, HP={updated_character.get('HP')}")
 
-    # 将检定结果写入消息
-    messages.append({
-        "role": "system",
-        "content": tool_message,
-    })
+    # 3. 理智损失（仅当本轮目睹恐怖）
+    if san_loss > 0:
+        result = execute_tool(
+            action="sanity_loss",
+            params={
+                "loss": san_loss,
+                "reason": pending.get("san_reason") or "不明恐怖事件",
+            },
+            character=updated_character,
+        )
+        updated_character = result.get("updated_character", updated_character)
+        tool_messages.append(result.get("message", ""))
+        logger.info(f"理智损失: {san_loss} 点, SAN={updated_character.get('SAN')}")
+
+    # 将工具结果逐条写入消息
+    for msg in tool_messages:
+        messages.append({
+            "role": "system",
+            "content": msg,
+        })
 
     return {
         **state,
@@ -229,14 +275,14 @@ def tool_node(state: KeeperState) -> KeeperState:
 
 def render_node(state: KeeperState) -> KeeperState:
     """
-    渲染节点 —— 将检定结果融入 KP 的环境叙事。
+    渲染节点 —— 将工具结果（检定/伤害/理智）融入 KP 的环境叙事。
 
-    仅当需要检定时才运行（由 tool_node 之后进入）。
+    仅当本轮有工具执行时运行（tool_node 之后进入）。
     职责：
         1. 提取 [KP回应]（游戏层面）+ [KP梗概]（环境叙事种子）
-        2. 提取检定结果（system 消息）
-        3. 调用 call_render() 将检定结果自然融入环境叙事
-        4. 将 kp_response 和 rendered narrative 分别写入消息
+        2. 收集内部标记之后 tool_node 追加的全部 system 消息（检定/伤害/理智）
+        3. 调用 call_render() 将工具结果自然融入环境叙事
+        4. 将合并后的结果与 rendered narrative 写入消息
         5. 判定 game_over 条件
     """
     logger.info("=== Render Node Start ===")
@@ -261,12 +307,20 @@ def render_node(state: KeeperState) -> KeeperState:
     if not narrative:
         narrative = "周围是一片令人窒息的黑暗……"
 
-    # 提取检定结果（最后一条 system 消息）
-    check_result = ""
-    for msg in reversed(messages):
-        if msg.get("role") == "system":
-            check_result = msg["content"]
-            break
+    # 提取本轮工具结果：内部标记之后的所有 system 消息
+    # （tool_node 可能追加多条：检定 / 伤害 / 理智，全部收集合并）
+    marker_idx = -1
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and (
+            "[KP回应]" in msg.get("content", "") or "[KP梗概]" in msg.get("content", "")
+        ):
+            marker_idx = i
+
+    tool_msgs = []
+    for i, msg in enumerate(messages):
+        if i > marker_idx and msg.get("role") == "system":
+            tool_msgs.append(msg["content"])
+    check_result = "\n\n".join(tool_msgs)
 
     # 调用渲染 Agent —— 将检定结果融入环境叙事
     rendered = call_render(narrative, check_result)
@@ -278,14 +332,19 @@ def render_node(state: KeeperState) -> KeeperState:
     elif character.get("SAN", 1) <= 0:
         game_over = True
 
-    # 清理内部标记（移除 [KP回应] 和 [KP梗概] 消息）
-    messages = [m for m in messages if "[KP回应]" not in m.get("content", "") and "[KP梗概]" not in m.get("content", "")]
+    # 单次遍历清理：移除内部标记消息 + 标记之后本轮追加的 tool 消息
+    cleaned = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant" and (
+            "[KP回应]" in m.get("content", "") or "[KP梗概]" in m.get("content", "")
+        ):
+            continue
+        if i > marker_idx and m.get("role") == "system":
+            continue
+        cleaned.append(m)
+    messages = cleaned
 
-    # 移除 tool_node 留下的原始检定结果消息（将会合并到下方统一输出）
-    if check_result:
-        messages = [m for m in messages if not (m.get("role") == "system" and m.get("content") == check_result)]
-
-    # 合并检定结果与 KP 回应为一条 system 消息
+    # 合并工具结果与 KP 回应为一条 system 消息
     combined_system = ""
     if check_result:
         combined_system += check_result
@@ -322,18 +381,20 @@ def render_node(state: KeeperState) -> KeeperState:
 
 def route_after_kp(state: KeeperState) -> Literal["tool_node", "end"]:
     """
-    根据 KP 输出的 need_check 决定下一步。
-    - need_check != "None" → 进入 tool_node 执行检定 → render_node 融合检定结果
-    - need_check == "None" → 直接结束（KP 输出已作为最终回复展示给玩家）
+    根据 KP 输出决定下一步。
+    - 属性检定 / 受到伤害 / 理智损失 任一存在 → tool_node 执行 → render_node 融合结果
+    - 均无 → 直接结束（KP 输出已作为最终回复展示给玩家）
     """
     pending = state.get("pending_check", {})
     need_check = pending.get("need_check", "None")
+    hp_damage = max(0, int(pending.get("hp_damage", 0) or 0))
+    san_loss = max(0, int(pending.get("san_loss", 0) or 0))
 
-    if need_check and need_check != "None":
-        logger.info(f"路由 → tool_node (need_check={need_check})")
+    if (need_check and need_check != "None") or hp_damage > 0 or san_loss > 0:
+        logger.info(f"路由 → tool_node (need_check={need_check}, hp_damage={hp_damage}, san_loss={san_loss})")
         return "tool_node"
     else:
-        logger.info("路由 → END (无需检定，KP 输出直接展示)")
+        logger.info("路由 → END (无需工具执行，KP 输出直接展示)")
         return "end"
 
 
