@@ -13,8 +13,6 @@ import os
 import uuid
 import time
 import json
-import copy
-import threading
 
 # 确保项目根目录在 Python 路径中
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,24 +30,6 @@ from utils.config import get_config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# 工作线程与脚本上下文之间的通信（模块级，每个 Streamlit 会话独立命名空间）。
-# 工作线程运行在裸线程中、没有 ScriptRunContext，**绝不访问 st.session_state**
-# （云端会话切换/重连时 session_state 访问会抛异常），只读写此 holder。
-#
-# 关键：Streamlit 每次整页重跑都会重新执行模块顶层代码，普通的
-# `_result_holder = {...}` 赋值会把 holder 重新绑定为空字典、把锁换成
-# 新对象（工作线程与脚本将持有两把不同的锁）。因此用「globals 中已
-# 存在则不重建」的守卫保住跨重跑状态。
-if "_round_lock" not in globals():
-    _round_lock = threading.Lock()
-if "_result_holder" not in globals():
-    _result_holder = {
-        "result": None,    # 工作线程完成后的 new_state 纯字典
-        "error": None,     # 工作线程异常文本
-        "abort": False,    # 跳过/重置中止标志
-        "phase": "",       # 当前阶段指示（检索知识库 / KP 思考与渲染）
-    }
 
 # ===================== 页面配置 =====================
 
@@ -235,7 +215,10 @@ def init_session():
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
-    # 后台线程结果经模块级 _result_holder 传递（工作线程不碰 session_state）
+    # 上一轮完成时间 —— 同步模型下防连点（Streamlit 串行执行 rerun，
+    # 排队中的第二次点击会在本轮完成后立刻执行，用时间窗口拦截）
+    if "_last_round_done" not in st.session_state:
+        st.session_state._last_round_done = 0.0
 
     # 初始化完成标志
     if "initialized" not in st.session_state:
@@ -467,11 +450,7 @@ def _reset_game():
     st.session_state.indexed_scenario_names = set()
     st.session_state.pop("pending_opening_content", None)
 
-    # 若有后台线程正在处理旧游戏：中止并丢弃其结果，防止旧状态复活
-    with _round_lock:
-        _result_holder["abort"] = True
-        _result_holder["result"] = None
-        _result_holder["error"] = None
+    st.session_state._last_round_done = 0.0
 
     new_character = generate_random_character()
     new_session_id = str(uuid.uuid4())
@@ -528,9 +507,6 @@ def render_main():
 
     # ---- 对话历史 ----
     _render_chat_history()
-
-    # ---- 应用后台线程完成的本轮结果（骰子/打字流/结束通知） ----
-    _maybe_apply_round_result()
 
     st.space("medium")
 
@@ -667,10 +643,7 @@ def _fallback_opening_from_text(content: str):
 
 
 def _render_input_area():
-    """渲染底部输入区域。处理中时由异步 fragment 展示状态帧并禁用输入。"""
-    # 处理中状态帧（run_every 每秒自刷新，后台阻塞期间持续可见）
-    _processing_fragment()
-
+    """渲染底部输入区域。同步模型：处理在提交的同一脚本运行内阻塞完成。"""
     if st.session_state.game_over:
         hp = st.session_state.character.get("HP", 0)
         san = st.session_state.character.get("SAN", 0)
@@ -682,15 +655,20 @@ def _render_input_area():
             st.warning("故事落幕。点击侧边栏「重置游戏」开启一段新的故事。", icon=":material/auto_stories:")
         return
 
-    # 处理中：不渲染输入框与建议按钮，从源头杜绝二次提交
-    # （结果应用后由 _maybe_apply_round_result 置 processing=False）
+    # 处理中（仅在处理期间手动刷新页面时可见此帧；正常流程由
+    # submit_mode="disable" 在提交后禁用输入直到本轮完成）
     if st.session_state.processing:
+        elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
+        with st.status("KP 正在编织命运", state="running"):
+            st.caption(f"已等待 {elapsed}s")
         return
 
-    # 正常输入
+    # 正常输入（submit_mode=disable：提交后输入框禁用直到本轮完成，
+    # 从源头杜绝双击回车）
     player_input = st.chat_input(
         placeholder="描述你的行动，例如：我小心翼翼地推开图书馆的门",
         disabled=st.session_state.processing,
+        submit_mode="disable",
     )
 
     if player_input:
@@ -706,247 +684,122 @@ def _render_input_area():
                 _process_player_input(sug)
 
 
-@st.fragment(run_every="1s")
-def _processing_fragment():
-    """
-    处理中状态帧：每秒自动刷新。
-
-    后台线程阻塞执行 graph.invoke 期间，脚本主流程已返回，
-    run_every 保证此帧持续重绘（修复原先处理中帧从未被渲染、
-    跳过按钮形同虚设的问题）。结果就绪后触发全页重渲染，
-    由 _maybe_apply_round_result 在脚本上下文中应用。
-    """
-    # 结果（或异常）就绪 → 全页重渲染应用
-    with _round_lock:
-        pending = (_result_holder["result"] is not None
-                   or _result_holder["error"] is not None)
-        phase = _result_holder["phase"]
-    if pending:
-        st.rerun()
-        return
-
-    if not st.session_state.processing:
-        return
-
-    elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
-
-    # 注意：st.status 标签必须固定不变（含每秒变化的 elapsed 会导致
-    # widget 隐式 key 变化、展开状态被重置），耗时与阶段信息放折叠体内
-    with st.status("KP 正在编织命运", state="running"):
-        phase_text = f" · {phase}" if phase else ""
-        st.caption(f"已等待 {elapsed}s{phase_text}")
-
-    # 跳过按钮放在 status 折叠体之外，无需展开即可点击
-    if elapsed >= 15:
-        col_a, col_b = st.columns([1, 3])
-        with col_a:
-            if st.button("跳过等待", key="skip_wait", icon=":material/skip_next:",
-                         help="中断当前请求，KP 会使用降级回复"):
-                # 先声明中止（与工作线程的提交互斥），再注入降级回复
-                with _round_lock:
-                    _result_holder["abort"] = True
-                    _result_holder["result"] = None
-                    _result_holder["error"] = None
-                st.session_state.processing = False
-                st.session_state.pop("_processing_start", None)
-
-                msgs = list(st.session_state.messages)
-                msgs.append({
-                    "role": "system",
-                    "content": "KP 响应超时，已被跳过。",
-                })
-                msgs.append({
-                    "role": "assistant",
-                    "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待，它不急。你决定继续前行。",
-                })
-                st.session_state.messages = msgs
-                st.session_state.current_suggestions = [
-                    "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
-                ]
-                st.rerun()
-        with col_b:
-            st.caption("KP 正在生成回复，请耐心等待，若超过 30 秒建议跳过")
-
-
 def _process_player_input(player_input: str):
     """
-    处理玩家输入：启动后台线程执行 RAG 检索 → LangGraph 调用。
+    处理玩家输入（同步模型，与最初的实现一致）：
+    RAG 检索 → LangGraph 调用 → 骰子动画 → 打字流 → 结束通知。
 
-    主流程立即返回，处理中帧由 _processing_fragment 每秒刷新渲染，
-    结果就绪后由 _maybe_apply_round_result 全页应用。
-    processing 标志在本次 rerun 内同步置位，后续独立点击触发的 rerun
-    在入口处被拦截，连点不会推两轮剧情。
+    阻塞执行在本次脚本运行内完成，结果必然在随后的整页重跑中显示。
+    不引入后台线程：云端环境下裸线程与 Streamlit 会话生命周期
+    的交互不可靠（曾导致结果丢失与前端卡死）。
 
-    关键设计：工作线程运行在裸线程中，绝不访问 st.session_state
-    （云端会话切换/重连时会抛异常），此处先在脚本上下文中把所需
-    对象快照为纯 Python 对象传入线程。
+    防连点：
+    - chat_input 使用 submit_mode="disable"（提交后输入框禁用）
+    - 建议按钮通过 _last_round_done 时间窗口拦截排队中的重复点击
+      （Streamlit 串行执行 rerun，排队点击会在本轮完成后立刻执行）
     """
-    # 防止重复处理（异步模型下此 guard 真正生效：处理中标志跨 rerun 可见）
+    # 防止重复处理
     if st.session_state.processing:
         return
 
-    snapshot = {
-        "player_input": player_input,
-        "graph": st.session_state.graph,
-        "state": copy.deepcopy(st.session_state.langgraph_state),
-        "character": copy.deepcopy(st.session_state.character),
-        "memory_manager": st.session_state.memory_manager,
-        "session_id": st.session_state.session_id,
-        "rag_collection": st.session_state.rag_collection,
-        "embedding_model": st.session_state.embedding_model,
-    }
-
-    with _round_lock:
-        _result_holder["result"] = None
-        _result_holder["error"] = None
-        _result_holder["abort"] = False
-        _result_holder["phase"] = ""
+    # 上一轮刚完成（3 秒内）：拦截排队中的连点
+    if time.time() - st.session_state.get("_last_round_done", 0.0) < 3:
+        return
 
     st.session_state.processing = True
     st.session_state._processing_start = time.time()
 
-    worker = threading.Thread(
-        target=_run_round_worker,
-        args=(snapshot,),
-        name="coc-round-worker",
-        daemon=True,
-    )
-    worker.start()
-
-
-def _run_round_worker(snapshot: dict):
-    """
-    后台工作线程：RAG 检索 + LangGraph 调用（阻塞 10-40 秒）。
-
-    线程内只读写快照与模块级 _result_holder（锁保护），
-    不访问 st.session_state。完成后检查中止标志，
-    被跳过/重置则丢弃结果；未跳过才提交结果，
-    由 fragment 检测并触发全页应用。
-    """
     try:
         # ---- RAG 检索 ----
         rag_context = ""
-        if (snapshot["rag_collection"] is not None
-                and snapshot["embedding_model"] is not None):
+        if (st.session_state.rag_collection is not None
+                and st.session_state.embedding_model is not None):
             try:
-                with _round_lock:
-                    _result_holder["phase"] = "检索知识库"
                 rag_context = retrieve_context(
-                    query=snapshot["player_input"],
-                    session_id=snapshot["session_id"],
-                    model=snapshot["embedding_model"],
+                    query=player_input,
+                    session_id=st.session_state.session_id,
+                    model=st.session_state.embedding_model,
                 )
             except Exception as e:
                 logger.warning(f"RAG 检索异常: {e}")
 
         # ---- 构建状态 ----
-        state = snapshot["state"]
+        state = st.session_state.langgraph_state
         state["rag_context"] = rag_context
-        state["character"] = snapshot["character"]
+        state["character"] = st.session_state.character
 
-        # ---- 调用 LangGraph（KP 思考 + 渲染 + 记忆整理均在此内） ----
-        with _round_lock:
-            _result_holder["phase"] = "KP 思考与渲染"
+        # ---- 调用 LangGraph（阻塞 15-40 秒） ----
         t0 = time.time()
-        new_state = run_one_round(
-            graph=snapshot["graph"],
-            state=state,
-            player_input=snapshot["player_input"],
-            memory_manager=snapshot["memory_manager"],
-        )
+        try:
+            new_state = run_one_round(
+                graph=st.session_state.graph,
+                state=state,
+                player_input=player_input,
+                memory_manager=st.session_state.memory_manager,
+            )
+        except Exception as e:
+            st.error(f"系统异常: {e}")
+            logger.error(f"Graph 调用异常: {e}")
+            return
+
         elapsed = time.time() - t0
         logger.info(f"本轮处理耗时: {elapsed:.1f}s")
 
-        # ---- 与跳过按钮互斥：被中止则丢弃结果 ----
-        with _round_lock:
-            if _result_holder["abort"]:
-                logger.info("本轮结果已被用户跳过，丢弃。")
-                return
-            _result_holder["result"] = new_state
+        # ---- 更新 Session State ----
+        st.session_state.langgraph_state = new_state
+        st.session_state.character = new_state.get("character", st.session_state.character)
+        st.session_state.game_over = new_state.get("game_over", False)
+        st.session_state.messages = new_state.get("messages", [])
 
-    except Exception as e:
-        logger.error(f"Graph 调用异常: {e}")
-        with _round_lock:
-            if not _result_holder["abort"]:
-                _result_holder["error"] = str(e)
+        # ---- 更新当前场景（直接使用 KP 输出的 scene 字段） ----
+        kp_scene = new_state.get("current_scene", "")
+        if kp_scene:
+            st.session_state.current_scene = kp_scene
+
+        # ---- 更新当前轮建议 ----
+        st.session_state.current_suggestions = new_state.get("suggestions", [])
+
+        # ---- 骰子动画（有检定时展示） ----
+        _show_dice_animation(new_state)
+
+        # ---- 流式渲染最新输出 ----
+        _stream_render(new_state)
+
+        # ---- 游戏结束通知 ----
+        if st.session_state.game_over:
+            hp = st.session_state.character.get("HP", 0)
+            san = st.session_state.character.get("SAN", 0)
+            if hp <= 0:
+                st.toast("调查员已死亡", icon=":material/skull:")
+                st.error(
+                    "## 调查员已死亡\n\n"
+                    "世界将永远不知道这里发生了什么……\n\n"
+                    "点击侧边栏「重置游戏」开始新的冒险。",
+                    icon=":material/skull:",
+                )
+            elif san <= 0:
+                st.toast("调查员陷入永久疯狂", icon=":material/cyclone:")
+                st.error(
+                    "## 调查员陷入永久疯狂\n\n"
+                    "理智的最后一根弦，已经断了。\n\n"
+                    "点击侧边栏「重置游戏」开始新的冒险。",
+                    icon=":material/cyclone:",
+                )
+            else:
+                st.toast("故事落幕", icon=":material/auto_stories:")
+                st.warning(
+                    "## 故事落幕\n\n"
+                    "这段冒险就此画上句号。无论结局是平静还是遗憾，"
+                    "那些无法言说的秘密将永远封存在记忆深处……\n\n"
+                    "点击侧边栏「重置游戏」开启一段新的故事。",
+                    icon=":material/auto_stories:",
+                )
 
     finally:
-        with _round_lock:
-            _result_holder["phase"] = ""
-
-
-def _maybe_apply_round_result():
-    """
-    在脚本上下文中应用后台线程完成的本轮结果：
-    更新 session state → 骰子动画 → 打字流 → 游戏结束通知。
-    每次全页重渲染时检查一次，无待应用结果时立即返回。
-    """
-    with _round_lock:
-        result = _result_holder["result"]
-        error = _result_holder["error"]
-        _result_holder["result"] = None
-        _result_holder["error"] = None
-
-    if result is None:
-        if error:
-            st.session_state.processing = False
-            st.session_state.pop("_processing_start", None)
-            st.error(f"系统异常: {error}")
-        return
-
-    # 结果应用后恢复正常输入
-    st.session_state.processing = False
-    st.session_state.pop("_processing_start", None)
-
-    # ---- 更新 Session State ----
-    st.session_state.langgraph_state = result
-    st.session_state.character = result.get("character", st.session_state.character)
-    st.session_state.game_over = result.get("game_over", False)
-    st.session_state.messages = result.get("messages", [])
-
-    # ---- 更新当前场景（直接使用 KP 输出的 scene 字段） ----
-    kp_scene = result.get("current_scene", "")
-    if kp_scene:
-        st.session_state.current_scene = kp_scene
-
-    # ---- 更新当前轮建议 ----
-    st.session_state.current_suggestions = result.get("suggestions", [])
-
-    # ---- 骰子动画（有检定时展示） ----
-    _show_dice_animation(result)
-
-    # ---- 流式渲染最新输出 ----
-    _stream_render(result)
-
-    # ---- 游戏结束通知 ----
-    if st.session_state.game_over:
-        hp = st.session_state.character.get("HP", 0)
-        san = st.session_state.character.get("SAN", 0)
-        if hp <= 0:
-            st.toast("调查员已死亡", icon=":material/skull:")
-            st.error(
-                "## 调查员已死亡\n\n"
-                "世界将永远不知道这里发生了什么……\n\n"
-                "点击侧边栏「重置游戏」开始新的冒险。",
-                icon=":material/skull:",
-            )
-        elif san <= 0:
-            st.toast("调查员陷入永久疯狂", icon=":material/cyclone:")
-            st.error(
-                "## 调查员陷入永久疯狂\n\n"
-                "理智的最后一根弦，已经断了。\n\n"
-                "点击侧边栏「重置游戏」开始新的冒险。",
-                icon=":material/cyclone:",
-            )
-        else:
-            st.toast("故事落幕", icon=":material/auto_stories:")
-            st.warning(
-                "## 故事落幕\n\n"
-                "这段冒险就此画上句号。无论结局是平静还是遗憾，"
-                "那些无法言说的秘密将永远封存在记忆深处……\n\n"
-                "点击侧边栏「重置游戏」开启一段新的故事。",
-                icon=":material/auto_stories:",
-            )
+        st.session_state.processing = False
+        st.session_state.pop("_processing_start", None)
+        st.session_state._last_round_done = time.time()
+        st.rerun()
 
 
 def _show_dice_animation(state: dict):
