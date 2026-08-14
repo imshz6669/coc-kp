@@ -23,15 +23,18 @@ import streamlit as st
 
 from backend.graph import build_graph, create_initial_state, run_one_round
 from backend.character import generate_random_character, validate_character
-from backend.state_manager import save_game_state, load_game_state, get_temp_status, clear_game_state
 from backend.memory import MemoryManager
-from rag.loader import create_embedding_model, create_chroma_collection, index_file, clear_collection, parse_file
+from rag.loader import create_embedding_model, create_chroma_collection, index_file, clear_collection, parse_file, cleanup_stale_collections
 from rag.retriever import retrieve_context
 from data.openings import get_random_opening
 from utils.config import get_config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 工作线程结果提交与跳过按钮之间的互斥锁，
+# 防止「跳过已点击但线程仍在提交结果」的竞态
+_round_lock = threading.Lock()
 
 # ===================== 页面配置 =====================
 
@@ -121,11 +124,19 @@ st.markdown("""
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 28px;
-        font-weight: bold;
-        color: var(--dice);
         animation: diceRoll 0.8s ease-out;
     }
+    /* 骰面数字：翻滚结束后弹出定格（COC 百分骰为十位+个位两颗骰） */
+    .dice-face {
+        font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+        font-size: 26px;
+        font-weight: bold;
+        color: var(--dice);
+        animation: resultPop 0.4s ease-out 0.8s both;
+    }
+    /* 第二颗骰错峰滚动，模拟先后停稳 */
+    .dice-inner.dice-delay { animation-delay: 0.15s; }
+    .dice-face.dice-delay { animation-delay: 0.95s; }
     .dice-result { animation: resultPop 0.4s ease-out 0.7s both; }
     .dice-info {
         flex: 1;
@@ -139,7 +150,7 @@ st.markdown("""
     .dice-outcome { font-size: 1.3rem; font-weight: bold; color: var(--dice); margin-top: 2px; }
     /* ========== 减少动效偏好：动画全部降级为静态 ========== */
     @media (prefers-reduced-motion: reduce) {
-        .dice-inner, .dice-container, .dice-result { animation: none !important; }
+        .dice-inner, .dice-container, .dice-result, .dice-face { animation: none !important; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -202,9 +213,25 @@ def init_session():
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
+    # 后台线程结果传递（异步处理模型）
+    if "_round_result" not in st.session_state:
+        st.session_state._round_result = None
+    if "_round_error" not in st.session_state:
+        st.session_state._round_error = None
+    if "_abort_request" not in st.session_state:
+        st.session_state._abort_request = False
+
     # 初始化完成标志
     if "initialized" not in st.session_state:
         st.session_state.initialized = True
+
+        # 首次启动：清理历史会话残留的过期 ChromaDB Collection
+        try:
+            cleaned = cleanup_stale_collections(current_session_id=st.session_state.session_id)
+            if cleaned:
+                logger.info(f"启动清理: 删除 {cleaned} 个过期 Collection")
+        except Exception as e:
+            logger.warning(f"启动清理 Collection 失败: {e}")
 
     # 当前场景位置（随着游戏推进更新）
     if "current_scene" not in st.session_state:
@@ -424,6 +451,12 @@ def _reset_game():
     st.session_state.indexed_scenario_names = set()
     st.session_state.pop("pending_opening_content", None)
 
+    # 若有后台线程正在处理旧游戏：中止并丢弃其结果，防止旧状态复活
+    with _round_lock:
+        st.session_state._abort_request = True
+        st.session_state._round_result = None
+    st.session_state._round_error = None
+
     new_character = generate_random_character()
     new_session_id = str(uuid.uuid4())
 
@@ -445,6 +478,12 @@ def _reset_game():
     )
 
     st.session_state.memory_manager = MemoryManager(session_id=new_session_id)
+
+    # 顺带清理一次过期 Collection（旧会话库刚已删除，此处清历史残留）
+    try:
+        cleanup_stale_collections(current_session_id=new_session_id)
+    except Exception as e:
+        logger.warning(f"重置时清理 Collection 失败: {e}")
 
     st.rerun()
 
@@ -473,6 +512,9 @@ def render_main():
 
     # ---- 对话历史 ----
     _render_chat_history()
+
+    # ---- 应用后台线程完成的本轮结果（骰子/打字流/结束通知） ----
+    _maybe_apply_round_result()
 
     st.space("medium")
 
@@ -609,7 +651,10 @@ def _fallback_opening_from_text(content: str):
 
 
 def _render_input_area():
-    """渲染底部输入区域。处理中时禁用输入防止堆积。"""
+    """渲染底部输入区域。处理中时由异步 fragment 展示状态帧并禁用输入。"""
+    # 处理中状态帧（run_every 每秒自刷新，后台阻塞期间持续可见）
+    _processing_fragment()
+
     if st.session_state.game_over:
         hp = st.session_state.character.get("HP", 0)
         san = st.session_state.character.get("SAN", 0)
@@ -621,38 +666,10 @@ def _render_input_area():
             st.warning("故事落幕。点击侧边栏「重置游戏」开启一段新的故事。", icon=":material/auto_stories:")
         return
 
-    # 处理中状态：原生 st.status + 超时跳过按钮
-    if st.session_state.processing:
-        elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
-        with st.status(f"KP 正在编织命运（已等待 {elapsed}s）", state="running"):
-            # 超过 15 秒后显示跳过按钮
-            if elapsed >= 15:
-                if st.button("跳过等待", key=f"skip_{elapsed}", icon=":material/skip_next:",
-                             help="中断当前请求，KP 会使用降级回复"):
-                    st.session_state.processing = False
-                    st.session_state.pop("_processing_start", None)
-                    # 注入降级回复
-                    msgs = list(st.session_state.messages)
-                    msgs.append({
-                        "role": "system",
-                        "content": "KP 响应超时，已被跳过。",
-                    })
-                    msgs.append({
-                        "role": "assistant",
-                        "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待，它不急。你决定继续前行。",
-                    })
-                    st.session_state.messages = msgs
-                    st.session_state.current_suggestions = [
-                        "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
-                    ]
-                    st.rerun()
-                st.caption("KP 正在生成回复，请耐心等待，若超过 30 秒建议跳过")
-        # 渲染建议（处理中禁用）
-        suggestions = st.session_state.get("current_suggestions", [])
-        if suggestions:
-            cols = st.columns(len(suggestions))
-            for i, (col, sug) in enumerate(zip(cols, suggestions)):
-                col.button(sug, key=f"sug_disabled_{i}", disabled=True, width="stretch")
+    # 处理中或结果待应用：不渲染输入框与建议按钮，从源头杜绝二次提交
+    if (st.session_state.processing
+            or st.session_state.get("_round_result") is not None
+            or st.session_state.get("_round_error")):
         return
 
     # 正常输入
@@ -674,23 +691,97 @@ def _render_input_area():
                 _process_player_input(sug)
 
 
+@st.fragment(run_every="1s")
+def _processing_fragment():
+    """
+    处理中状态帧：每秒自动刷新。
+
+    后台线程阻塞执行 graph.invoke 期间，脚本主流程已返回，
+    run_every 保证此帧持续重绘（修复原先处理中帧从未被渲染、
+    跳过按钮形同虚设的问题）。结果就绪后触发全页重渲染，
+    由 _maybe_apply_round_result 在脚本上下文中应用。
+    """
+    # 结果（或异常）就绪 → 全页重渲染应用
+    if (st.session_state.get("_round_result") is not None
+            or st.session_state.get("_round_error")):
+        st.rerun()
+        return
+
+    if not st.session_state.processing:
+        return
+
+    elapsed = int(time.time() - st.session_state.get("_processing_start", time.time()))
+    with st.status(f"KP 正在编织命运（已等待 {elapsed}s）", state="running"):
+        if elapsed >= 15:
+            if st.button("跳过等待", key="skip_wait", icon=":material/skip_next:",
+                         help="中断当前请求，KP 会使用降级回复"):
+                # 先声明中止（与工作线程的提交互斥），再注入降级回复
+                with _round_lock:
+                    st.session_state._abort_request = True
+                    st.session_state._round_result = None
+                st.session_state._round_error = None
+                st.session_state.processing = False
+                st.session_state.pop("_processing_start", None)
+
+                msgs = list(st.session_state.messages)
+                msgs.append({
+                    "role": "system",
+                    "content": "KP 响应超时，已被跳过。",
+                })
+                msgs.append({
+                    "role": "assistant",
+                    "content": "你环顾四周，之前的行动似乎暂时没有结果。也许换个方式或方向会有新的发现。黑暗中有什么东西正在耐心地等待，它不急。你决定继续前行。",
+                })
+                st.session_state.messages = msgs
+                st.session_state.current_suggestions = [
+                    "换个角度重新观察", "换个方向继续调查", "找附近的人打听消息"
+                ]
+                st.rerun()
+            st.caption("KP 正在生成回复，请耐心等待，若超过 30 秒建议跳过")
+        else:
+            st.caption("KP 正在编织剧情，请稍候……")
+
+
 def _process_player_input(player_input: str):
     """
-    处理玩家输入：RAG 检索 → LangGraph 调用 → 流式渲染结果。
-    设置 processing 标志防止输入堆积。
+    处理玩家输入：启动后台线程执行 RAG 检索 → LangGraph 调用。
+
+    主流程立即返回，处理中帧由 _processing_fragment 每秒刷新渲染，
+    结果就绪后由 _maybe_apply_round_result 全页应用。
+    processing 标志在本次 rerun 内同步置位，后续独立点击触发的 rerun
+    在入口处被拦截，连点不会推两轮剧情。
     """
-    # 防止重复处理
+    # 防止重复处理（异步模型下此 guard 真正生效：处理中标志跨 rerun 可见）
     if st.session_state.processing:
-        st.warning("KP 正在处理上一轮请求，请稍候……")
         return
 
     st.session_state.processing = True
     st.session_state._processing_start = time.time()
+    st.session_state._abort_request = False
+    st.session_state._round_result = None
+    st.session_state._round_error = None
 
+    worker = threading.Thread(
+        target=_run_round_worker,
+        args=(player_input,),
+        name="coc-round-worker",
+        daemon=True,
+    )
+    worker.start()
+
+
+def _run_round_worker(player_input: str):
+    """
+    后台工作线程：RAG 检索 + LangGraph 调用（阻塞 10-40 秒）。
+
+    完成后在锁内检查中止标志，被跳过/重置则丢弃结果；
+    未跳过才写入 _round_result，由 fragment 检测并触发全页应用。
+    """
     try:
         # ---- RAG 检索 ----
         rag_context = ""
-        if st.session_state.rag_collection is not None and st.session_state.embedding_model is not None:
+        if (st.session_state.rag_collection is not None
+                and st.session_state.embedding_model is not None):
             try:
                 rag_context = retrieve_context(
                     query=player_input,
@@ -707,75 +798,98 @@ def _process_player_input(player_input: str):
 
         # ---- 调用 LangGraph ----
         t0 = time.time()
-        try:
-            new_state = run_one_round(
-                graph=st.session_state.graph,
-                state=state,
-                player_input=player_input,
-                memory_manager=st.session_state.memory_manager,
-            )
-        except Exception as e:
-            st.error(f"系统异常: {e}")
-            logger.error(f"Graph 调用异常: {e}")
-            return
-
+        new_state = run_one_round(
+            graph=st.session_state.graph,
+            state=state,
+            player_input=player_input,
+            memory_manager=st.session_state.memory_manager,
+        )
         elapsed = time.time() - t0
         logger.info(f"本轮处理耗时: {elapsed:.1f}s")
 
-        # ---- 更新 Session State ----
-        st.session_state.langgraph_state = new_state
-        st.session_state.character = new_state.get("character", st.session_state.character)
-        st.session_state.game_over = new_state.get("game_over", False)
-        st.session_state.messages = new_state.get("messages", [])
+        # ---- 与跳过按钮互斥：被中止则丢弃结果 ----
+        with _round_lock:
+            if st.session_state.get("_abort_request"):
+                logger.info("本轮结果已被用户跳过，丢弃。")
+                return
+            st.session_state._round_result = new_state
 
-        # ---- 更新当前场景（直接使用 KP 输出的 scene 字段） ----
-        kp_scene = new_state.get("current_scene", "")
-        if kp_scene:
-            st.session_state.current_scene = kp_scene
-
-        # ---- 更新当前轮建议 ----
-        st.session_state.current_suggestions = new_state.get("suggestions", [])
-
-        # ---- 骰子动画（有检定时展示） ----
-        _show_dice_animation(new_state)
-
-        # ---- 流式渲染最新输出 ----
-        _stream_render(new_state)
-
-        # ---- 游戏结束通知 ----
-        if st.session_state.game_over:
-            hp = st.session_state.character.get("HP", 0)
-            san = st.session_state.character.get("SAN", 0)
-            if hp <= 0:
-                st.toast("调查员已死亡", icon=":material/skull:")
-                st.error(
-                    "## 调查员已死亡\n\n"
-                    "世界将永远不知道这里发生了什么……\n\n"
-                    "点击侧边栏「重置游戏」开始新的冒险。",
-                    icon=":material/skull:",
-                )
-            elif san <= 0:
-                st.toast("调查员陷入永久疯狂", icon=":material/cyclone:")
-                st.error(
-                    "## 调查员陷入永久疯狂\n\n"
-                    "理智的最后一根弦，已经断了。\n\n"
-                    "点击侧边栏「重置游戏」开始新的冒险。",
-                    icon=":material/cyclone:",
-                )
-            else:
-                st.toast("故事落幕", icon=":material/auto_stories:")
-                st.warning(
-                    "## 故事落幕\n\n"
-                    "这段冒险就此画上句号。无论结局是平静还是遗憾，"
-                    "那些无法言说的秘密将永远封存在记忆深处……\n\n"
-                    "点击侧边栏「重置游戏」开启一段新的故事。",
-                    icon=":material/auto_stories:",
-                )
+    except Exception as e:
+        logger.error(f"Graph 调用异常: {e}")
+        with _round_lock:
+            if not st.session_state.get("_abort_request"):
+                st.session_state._round_error = str(e)
 
     finally:
         st.session_state.processing = False
         st.session_state.pop("_processing_start", None)
-        st.rerun()
+
+
+def _maybe_apply_round_result():
+    """
+    在脚本上下文中应用后台线程完成的本轮结果：
+    更新 session state → 骰子动画 → 打字流 → 游戏结束通知。
+    每次全页重渲染时检查一次，无待应用结果时立即返回。
+    """
+    result = st.session_state.get("_round_result")
+    if result is None:
+        err = st.session_state.get("_round_error")
+        if err:
+            st.session_state._round_error = None
+            st.error(f"系统异常: {err}")
+        return
+
+    st.session_state._round_result = None
+
+    # ---- 更新 Session State ----
+    st.session_state.langgraph_state = result
+    st.session_state.character = result.get("character", st.session_state.character)
+    st.session_state.game_over = result.get("game_over", False)
+    st.session_state.messages = result.get("messages", [])
+
+    # ---- 更新当前场景（直接使用 KP 输出的 scene 字段） ----
+    kp_scene = result.get("current_scene", "")
+    if kp_scene:
+        st.session_state.current_scene = kp_scene
+
+    # ---- 更新当前轮建议 ----
+    st.session_state.current_suggestions = result.get("suggestions", [])
+
+    # ---- 骰子动画（有检定时展示） ----
+    _show_dice_animation(result)
+
+    # ---- 流式渲染最新输出 ----
+    _stream_render(result)
+
+    # ---- 游戏结束通知 ----
+    if st.session_state.game_over:
+        hp = st.session_state.character.get("HP", 0)
+        san = st.session_state.character.get("SAN", 0)
+        if hp <= 0:
+            st.toast("调查员已死亡", icon=":material/skull:")
+            st.error(
+                "## 调查员已死亡\n\n"
+                "世界将永远不知道这里发生了什么……\n\n"
+                "点击侧边栏「重置游戏」开始新的冒险。",
+                icon=":material/skull:",
+            )
+        elif san <= 0:
+            st.toast("调查员陷入永久疯狂", icon=":material/cyclone:")
+            st.error(
+                "## 调查员陷入永久疯狂\n\n"
+                "理智的最后一根弦，已经断了。\n\n"
+                "点击侧边栏「重置游戏」开始新的冒险。",
+                icon=":material/cyclone:",
+            )
+        else:
+            st.toast("故事落幕", icon=":material/auto_stories:")
+            st.warning(
+                "## 故事落幕\n\n"
+                "这段冒险就此画上句号。无论结局是平静还是遗憾，"
+                "那些无法言说的秘密将永远封存在记忆深处……\n\n"
+                "点击侧边栏「重置游戏」开启一段新的故事。",
+                icon=":material/auto_stories:",
+            )
 
 
 def _show_dice_animation(state: dict):
@@ -802,7 +916,7 @@ def _show_dice_animation(state: dict):
     import re
     panels = []
 
-    # ---- 1. 属性检定面板 ----
+    # ---- 1. 属性检定面板：COC 百分骰惯例，十位骰 + 个位骰两颗 ----
     check_match = re.search(r'【(\S+?)检定', system_msg)
     if check_match:
         attr_name = check_match.group(1)
@@ -811,15 +925,23 @@ def _show_dice_animation(state: dict):
         dice_roll = roll_match.group(1) if roll_match else "?"
         dice_target = target_match.group(1) if target_match else "?"
 
+        # 百分骰拆分：37 → 十位骰 "30" + 个位骰 "7"；01 大成功 → "00" + "1"；
+        # 100 → "00" + "0"（COC 惯例 00+0 读作 100）
+        roll_val = int(dice_roll) if str(dice_roll).isdigit() else 0
+        tens_face = f"{(roll_val // 10 * 10) % 100:02d}"
+        units_face = str(roll_val % 10)
+
         is_success = any(w in system_msg for w in ["成功", "通过", "大成功"])
-        result_emoji = "🎉" if is_success else "💥"
         result_text = "成功" if is_success else ("大失败…" if "大失败" in system_msg else "失败")
         fail_class = "" if is_success else " dice-fail"
 
         panels.append(f"""
     <div class="dice-container{fail_class}">
         <div class="dice-cube">
-            <div class="dice-inner">{result_emoji}</div>
+            <div class="dice-inner"><span class="dice-face">{tens_face}</span></div>
+        </div>
+        <div class="dice-cube">
+            <div class="dice-inner dice-delay"><span class="dice-face dice-delay">{units_face}</span></div>
         </div>
         <div class="dice-info dice-result">
             <div class="dice-attr">🎲 {attr_name}检定</div>
@@ -842,7 +964,7 @@ def _show_dice_animation(state: dict):
         panels.append(f"""
     <div class="dice-container dice-damage">
         <div class="dice-cube">
-            <div class="dice-inner">⚔️</div>
+            <div class="dice-inner"><span class="dice-face">{damage}</span></div>
         </div>
         <div class="dice-info dice-result">
             <div class="dice-attr">⚔️ 受到伤害</div>
@@ -863,7 +985,7 @@ def _show_dice_animation(state: dict):
         panels.append(f"""
     <div class="dice-container dice-san">
         <div class="dice-cube">
-            <div class="dice-inner">🧠</div>
+            <div class="dice-inner"><span class="dice-face">{san_loss}</span></div>
         </div>
         <div class="dice-info dice-result">
             <div class="dice-attr">🧠 理智损失</div>

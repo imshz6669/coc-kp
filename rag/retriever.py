@@ -27,6 +27,23 @@ class _NoOpEmbedding(EmbeddingFunction):
 from utils.config import RAG_TOP_K, RAG_SIMILARITY_THRESHOLD
 
 
+def _dist_to_similarity(dist: float, space: str = "l2") -> float:
+    """
+    距离 → 余弦相似度，按 Collection 的度量空间自适应转换。
+
+    - space == "cosine"：ChromaDB 返回余弦距离 ∈ [0, 2]，sim = 1 - dist
+    - space == "l2"（旧 Collection 默认）：向量已 L2 归一化时，
+      精确转换 cos_sim = 1 - dist²/2（dist ∈ [0, 2]）
+
+    两条路径均连续单调，钳制到 [0, 1]，不存在分段跳变。
+    """
+    if space == "cosine":
+        return max(0.0, min(1.0, 1.0 - dist))
+    if dist < 0:
+        dist = 0.0
+    return max(0.0, min(1.0, 1.0 - dist * dist / 2.0))
+
+
 def retrieve_context(
     query: str,
     session_id: str,
@@ -69,12 +86,21 @@ def retrieve_context(
     except Exception:
         return ""
 
-    # 向量化查询
+    # 向量化查询（显式 L2 归一化，与入库侧保持一致）
     try:
-        query_embedding = model.encode([query]).tolist()
+        query_embedding = model.encode([query], normalize_embeddings=True).tolist()
     except Exception as e:
         logger.error(f"查询向量化失败: {e}")
         return ""
+
+    # 读取 Collection 的度量空间：新库为 cosine，旧库为默认 l2
+    space = "l2"
+    try:
+        meta = collection.metadata or {}
+        space = str(meta.get("hnsw:space", "l2"))
+    except Exception:
+        pass
+    logger.info(f"RAG 检索空间: {space}")
 
     # 检索
     try:
@@ -93,19 +119,11 @@ def retrieve_context(
     documents = results["documents"][0]
     distances = results.get("distances", [[]])[0]
 
-    # 根据相似度阈值过滤
-    # ChromaDB 返回的距离因后端不同而异：
-    # - Rust 后端 (PersistentClient): L2 距离 (0~2, 越小越相似)
-    # - 旧后端 (duckdb+parquet): 余弦距离 (0~1, 越小越相似)
+    # 根据相似度阈值过滤。转换见 _dist_to_similarity()（按空间自适应）。
     relevant_parts = []
     for i, doc in enumerate(documents):
         dist = distances[i] if i < len(distances) else 0.0
-
-        # 统一转为相似度：L2 距离用 1 - dist/2 近似余弦相似度
-        if dist > 1.0:
-            similarity = max(0.0, 1.0 - dist / 2.0)
-        else:
-            similarity = 1.0 - dist
+        similarity = _dist_to_similarity(dist, space)
 
         if similarity >= threshold:
             relevant_parts.append(doc)

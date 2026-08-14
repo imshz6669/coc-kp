@@ -173,6 +173,19 @@ def _call_with_retry(
             content = response.choices[0].message.content
             if content is None:
                 raise RuntimeError("LLM 返回空内容")
+
+            # 输出被 max_tokens 截断：翻倍 token 上限重试，避免语句半截
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length" and attempt < API_MAX_RETRIES:
+                new_max = min(max_tokens * 2, 4096)
+                logger.warning(
+                    f"{description} 输出被截断 (finish_reason=length)，"
+                    f"以 max_tokens={new_max} 重试..."
+                )
+                max_tokens = new_max
+                time.sleep(1.0)
+                continue
+
             return content.strip()
 
         except Exception as e:
@@ -280,7 +293,7 @@ def call_kp(
                 # _parse_kp_json 现在含降级解析（方法4），几乎总能返回有效结果
                 parse_method = "JSON" if result.get("need_check") != "None" or result.get("scene") else "heuristic"
                 logger.info(f"KP 解析成功 ({parse_method}), need_check={result['need_check']}")
-                return result
+                return _normalize_kp_result(result)
 
             # JSON 结构解析失败且降级文本太短（<30字），尝试格式纠正
             if attempt == 0:
@@ -299,7 +312,7 @@ def call_kp(
     if raw_output and len(raw_output) > 30:
         extracted = _extract_from_narrative(raw_output)
         logger.warning(f"KP 使用降级提取。原始输出前200字: {raw_output[:200]}")
-        return extracted
+        return _normalize_kp_result(extracted)
 
     logger.error("KP 调用完全失败，使用硬编码兜底回复。")
     return {
@@ -345,12 +358,12 @@ def call_render(narrative: str, check_result: str = "") -> str:
             description="Render",
         )
         logger.info(f"Render 输出: {rendered[:200]}...")
-        return rendered
+        return _normalize_generated_text(rendered)
 
     except RuntimeError as e:
         logger.error(f"Render 调用最终失败: {e}")
         # 失败时直接返回原始梗概
-        return narrative
+        return _normalize_generated_text(narrative)
 
 
 # ===================== JSON 解析辅助 =====================
@@ -597,3 +610,58 @@ def _safe_int(value: Any, default: int = 0, hi: int = 999) -> int:
     except (TypeError, ValueError):
         return default
     return max(0, min(n, hi))
+
+
+# ===================== 生成文本规范化 =====================
+
+_SENTENCE_END = "。！？…"
+_CLOSING_CHARS = "\"”」』）)]"
+
+
+def _normalize_generated_text(text: str) -> str:
+    """
+    规范化 LLM 生成文本，修复两类常见输出问题：
+
+    1. 标点错用：AI 生成的 em-dash / en-dash 一律替换为常规标点
+       （"——" → "，"、"—" → "，"，数字区间 "–" → "-"）。
+    2. 语句不完整：若文本不以句末标点结尾（被 max_tokens 截断），
+       裁剪到最后一个完整句子，并追加"……"暗示未尽之意。
+
+    注意：仅用于 KP / Render 的生成内容，不作用于玩家输入。
+    """
+    if not text:
+        return text
+
+    text = text.replace("——", "，").replace("—", "，").replace("–", "-")
+
+    stripped = text.rstrip()
+    if not stripped:
+        return text
+
+    # 以句末标点或闭合符号结尾 → 视为完整
+    if stripped[-1] in _SENTENCE_END or stripped[-1] in _CLOSING_CHARS:
+        return text
+
+    # 找到最后一个完整句的结尾位置
+    cut = -1
+    for ch in _SENTENCE_END:
+        idx = stripped.rfind(ch)
+        if idx > cut:
+            cut = idx
+
+    if cut <= 0:
+        return text  # 全文无句界，无法安全裁剪
+
+    # 保留句末标点后紧跟的闭合引号/括号
+    end = cut + 1
+    while end < len(stripped) and stripped[end] in _CLOSING_CHARS:
+        end += 1
+
+    return stripped[:end] + "……"
+
+
+def _normalize_kp_result(result: Dict[str, str]) -> Dict[str, str]:
+    """规范化 KP 输出中的全部文本字段。"""
+    result["kp_response"] = _normalize_generated_text(str(result.get("kp_response", "")))
+    result["narrative"] = _normalize_generated_text(str(result.get("narrative", "")))
+    return result

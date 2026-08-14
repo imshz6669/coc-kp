@@ -16,7 +16,7 @@ from typing import Any, Dict, List, TypedDict, Literal
 
 from langgraph.graph import StateGraph, END
 
-from .agents import call_kp, call_render
+from .agents import call_kp, call_render, _normalize_generated_text
 from .tools import execute_tool
 from .character import update_character, validate_character
 from .state_manager import trim_messages, get_temp_status
@@ -574,10 +574,11 @@ def _compress_messages(state: dict, memory_manager) -> dict:
                 break
 
     # 如果有摘要，在最前面插入一条摘要标记（仅用于 UI 展示）
+    # 200 字硬截断改为按句界裁剪，避免前情提要以半句话结尾
     if summary and len(summary) > 20:
         kept.insert(0, {
             "role": "system",
-            "content": f"📜 前情提要：{summary[:200]}",
+            "content": f"📜 前情提要：{_normalize_generated_text(summary[:200])}",
         })
 
     logger.info(f"消息压缩: {len(messages)} → {len(kept)} 条 (保留最近 {MAX_CONTEXT_ROUNDS} 轮)")

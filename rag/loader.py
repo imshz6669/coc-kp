@@ -9,6 +9,8 @@ Collection 命名：coc_rag_{session_id}
 
 import os
 import uuid
+import time
+from datetime import datetime
 from typing import List
 
 import chromadb
@@ -215,8 +217,15 @@ def create_chroma_collection(session_id: str) -> chromadb.Collection:
         collection = client.create_collection(
             name=collection_name,
             embedding_function=_NoOpEmbedding(),
+            # 显式指定余弦空间：bge 模型向量按余弦相似度检索（官方要求），
+            # 不再依赖 PersistentClient 默认的 L2 距离。
+            # created_at 供 cleanup_stale_collections 做年龄判定。
+            metadata={
+                "hnsw:space": "cosine",
+                "created_at": datetime.now().isoformat(),
+            },
         )
-        logger.info(f"ChromaDB Collection 创建成功: {collection_name}")
+        logger.info(f"ChromaDB Collection 创建成功: {collection_name} (space=cosine)")
         return collection
 
     except Exception as e:
@@ -254,9 +263,9 @@ def index_file(
         logger.warning(f"文件内容为空或无有效文本: {file_path}")
         return 0
 
-    # 向量化
+    # 向量化（显式 L2 归一化：bge 模型要求归一化后按余弦相似度/点积检索）
     try:
-        embeddings = model.encode(chunks).tolist()
+        embeddings = model.encode(chunks, normalize_embeddings=True).tolist()
     except Exception as e:
         logger.error(f"向量化失败: {e}")
         raise RuntimeError(f"文本向量化失败: {e}")
@@ -296,3 +305,68 @@ def clear_collection(session_id: str) -> bool:
     except Exception as e:
         logger.warning(f"删除 Collection 失败（可能不存在）: {e}")
         return False
+
+
+def cleanup_stale_collections(
+    max_age_hours: int = 24,
+    current_session_id: str = "",
+    db_path: str = "./chroma_db",
+) -> int:
+    """
+    清理过期的历史 Collection，防止 chroma_db 目录垃圾累积。
+
+    每次新会话都会创建 coc_rag_{session_id} Collection，而重置游戏只删除
+    当前会话的库，历史库会永久残留。清理规则：
+
+    - 只处理 coc_rag_* 命名空间的 Collection
+    - 跳过当前会话的 Collection
+    - 有 created_at 元数据（本修复后创建）：超过 max_age_hours 未创建才删除
+    - 无 created_at（历史遗留，创建于本修复之前）：视为过期，立即删除
+
+    参数：
+        max_age_hours      : 保留时长（小时）
+        current_session_id : 当前会话 ID（豁免删除）
+        db_path            : ChromaDB 持久化目录（测试可注入临时目录）
+
+    返回：
+        清理的 Collection 数量。
+    """
+    if not os.path.isdir(db_path):
+        return 0
+
+    client = chromadb.PersistentClient(path=db_path)
+    try:
+        collections = client.list_collections()
+    except Exception as e:
+        logger.error(f"列出 Collection 失败: {e}")
+        return 0
+
+    current_name = f"coc_rag_{current_session_id}" if current_session_id else ""
+    threshold = time.time() - max_age_hours * 3600
+
+    cleaned = 0
+    for coll in collections:
+        name = coll.name
+        if not name.startswith("coc_rag_") or name == current_name:
+            continue
+
+        meta = coll.metadata or {}
+        created = meta.get("created_at")
+        if created:
+            try:
+                ts = datetime.fromisoformat(str(created)).timestamp()
+                if ts >= threshold:
+                    continue  # 仍在保留期内
+            except ValueError:
+                pass  # 时间戳损坏视为过期
+
+        try:
+            client.delete_collection(name)
+            cleaned += 1
+            logger.info(f"清理过期 Collection: {name}")
+        except Exception as e:
+            logger.warning(f"清理 Collection 失败 {name}: {e}")
+
+    if cleaned:
+        logger.info(f"ChromaDB 清理完成: 删除 {cleaned} 个过期 Collection")
+    return cleaned

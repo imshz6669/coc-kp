@@ -89,6 +89,8 @@ class MemoryManager:
 
         # 从磁盘加载已有摘要
         self._load_summaries()
+        # 恢复上次概括失败但已落盘的轮次，并入待概括队列
+        self._load_failed_backup()
         self._rebuild_context()
 
         logger.info(
@@ -132,14 +134,18 @@ class MemoryManager:
         """
         调用 DeepSeek Flash 概括 pending_rounds，写入磁盘。
 
-        概括失败时记录日志并清空缓冲区（不清空会导致无限重试），
-        不影响游戏主流程。
+        失败容错策略：
+        - 失败时**不清空缓冲区**，并落盘备份 pending_rounds_XXXX_XXXX.json
+          （进程重启后由 _load_failed_backup 恢复，避免数据永久丢失）
+        - 下一轮 add_round 达到阈值时会自动重试，本轮对话自然并入
+          下一次概括的更大范围（rounds_range 连续，round_counter 不错位）
+        - 成功后清空缓冲区并删除备份文件
 
         参数：
             client : OpenAI 兼容客户端
 
         返回：
-            True 表示概括成功，False 表示失败（降级处理）。
+            True 表示概括成功，False 表示失败（调用方可忽略，不影响游戏主流程）。
         """
         if not self.pending_rounds:
             logger.warning("Memory: 无待概括轮次，跳过。")
@@ -168,14 +174,16 @@ class MemoryManager:
 
             logger.info(f"Memory: 概括完成 → {self.memory_dir}")
 
+            # 成功后才清空缓冲区，并清理历史失败备份
+            self.pending_rounds.clear()
+            self._clear_failed_backups()
+            return True
+
         except Exception as e:
             logger.error(f"Memory: 概括失败 ({rounds_range}): {e}")
-
-        finally:
-            # 无论成功与否，清空缓冲区避免无限重试
-            self.pending_rounds.clear()
-
-        return True
+            # 保留缓冲区（下一轮重试）+ 落盘备份（防进程重启丢数据）
+            self._save_failed_backup()
+            return False
 
     def get_context(self) -> str:
         """
@@ -237,8 +245,9 @@ class MemoryManager:
             summary_type = data.get("type", "summary")
             if summary_type == "meta_summary":
                 meta_summaries.append(data)
-            else:
+            elif summary_type == "summary":
                 individual_summaries.append(data)
+            # 其他类型（如 failed_backup 备份文件）不参与摘要加载
 
         # 按 index 排序
         individual_summaries.sort(key=lambda s: s.get("index", 0))
@@ -300,6 +309,104 @@ class MemoryManager:
         if len(self._memory_context) > 2500:
             self._memory_context = self._memory_context[:2500] + "…"
             logger.info("Memory: 上下文过长，已截断至 2500 字符")
+
+    def _save_failed_backup(self) -> None:
+        """
+        概括失败时将待概括轮次落盘备份，防止进程重启导致记忆永久丢失。
+
+        文件名：pending_rounds_{首轮:04d}_{末轮:04d}.json
+        同一范围重复失败时覆盖写入，范围扩大时生成新文件，
+        成功后由 _clear_failed_backups 统一清理。
+        """
+        if not self.pending_rounds:
+            return
+
+        first = self.pending_rounds[0]["round_num"]
+        last = self.pending_rounds[-1]["round_num"]
+        filename = f"pending_rounds_{first:04d}_{last:04d}.json"
+        filepath = os.path.join(self.memory_dir, filename)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump({
+                    "type": "failed_backup",
+                    "version": 1,
+                    "failed_at": datetime.now().isoformat(),
+                    "rounds": self.pending_rounds,
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(
+                f"Memory: 概括失败，已备份 {len(self.pending_rounds)} 轮到 {filename}"
+            )
+        except Exception as e:
+            logger.error(f"Memory: 失败备份写入失败: {e}")
+
+    def _load_failed_backup(self) -> None:
+        """
+        启动时恢复上次概括失败但已落盘的轮次，并入待概括队列。
+
+        按 round_num 去重合并后删除备份文件；round_counter 对齐到
+        备份中的最大轮号，保证后续轮次编号连续、不错位。
+        """
+        try:
+            files = sorted(os.listdir(self.memory_dir))
+        except Exception as e:
+            logger.error(f"Memory: 列出目录失败: {e}")
+            return
+
+        for filename in files:
+            if not filename.startswith("pending_rounds_") or not filename.endswith(".json"):
+                continue
+
+            filepath = os.path.join(self.memory_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Memory: 读取失败备份异常 {filename}: {e}")
+                continue
+
+            if data.get("type") != "failed_backup":
+                continue
+
+            rounds = data.get("rounds", [])
+            if not rounds:
+                os.remove(filepath)
+                continue
+
+            existing = {r.get("round_num") for r in self.pending_rounds}
+            restored = 0
+            for rd in rounds:
+                rn = rd.get("round_num")
+                if rn is not None and rn not in existing:
+                    self.pending_rounds.append(rd)
+                    existing.add(rn)
+                    restored += 1
+            self.pending_rounds.sort(key=lambda r: r.get("round_num", 0))
+
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+
+            max_round = max((r.get("round_num", 0) for r in rounds), default=0)
+            self.round_counter = max(self.round_counter, max_round)
+            logger.info(
+                f"Memory: 恢复 {restored} 轮失败概括 → 待概括队列，"
+                f"round_counter 对齐到 {self.round_counter}"
+            )
+
+    def _clear_failed_backups(self) -> None:
+        """概括成功后清理全部失败备份文件。"""
+        try:
+            files = os.listdir(self.memory_dir)
+        except Exception:
+            return
+        for filename in files:
+            if not filename.startswith("pending_rounds_") or not filename.endswith(".json"):
+                continue
+            try:
+                os.remove(os.path.join(self.memory_dir, filename))
+            except OSError:
+                pass
 
     def _save_summary(self, summary_data: Dict[str, Any]) -> str:
         """

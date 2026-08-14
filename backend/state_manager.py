@@ -1,10 +1,8 @@
 """
-状态管理模块 —— 对话截断、游戏状态存取、临时状态维护。
+状态管理模块 —— 对话截断、临时状态维护。
 
 提供：
     - trim_messages()        : 对话截断，仅保留最近 N 轮
-    - save_game_state()      : 保存游戏状态到内存
-    - load_game_state()      : 从内存加载游戏状态
     - get_temp_status()      : 获取角色临时状态描述
     - set_temp_status()      : 设置临时状态
 """
@@ -37,55 +35,6 @@ def trim_messages(messages: List[Dict[str, str]], max_rounds: int = None) -> Lis
 
     # 从末尾向前保留 max_rounds 轮
     return messages[-(max_rounds * 2):]
-
-
-# ---------- 游戏状态存储（会话级内存） ----------
-
-_game_state_registry: Dict[str, Dict[str, Any]] = {}
-
-
-def save_game_state(session_id: str, character: Dict[str, Any], game_over: bool = False) -> None:
-    """
-    保存指定会话的游戏状态。
-
-    参数：
-        session_id : 会话唯一标识
-        character  : 角色字典
-        game_over  : 游戏是否结束
-    """
-    _game_state_registry[session_id] = {
-        "character": copy.deepcopy(character),
-        "game_over": game_over,
-    }
-
-
-def load_game_state(session_id: str) -> Dict[str, Any]:
-    """
-    加载指定会话的游戏状态。
-
-    返回：
-        {
-            "character": dict | None,
-            "game_over": bool,
-        }
-    """
-    if session_id in _game_state_registry:
-        state = _game_state_registry[session_id]
-        return {
-            "character": copy.deepcopy(state["character"]),
-            "game_over": state["game_over"],
-        }
-    return {
-        "character": None,
-        "game_over": False,
-    }
-
-
-def clear_game_state(session_id: str) -> None:
-    """
-    清除指定会话的游戏状态。
-    """
-    _game_state_registry.pop(session_id, None)
 
 
 # ---------- 临时状态维护 ----------
